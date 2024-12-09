@@ -19,6 +19,8 @@ from hti import humanize, HTIOutput
 
 # added by mika_jdp
 import numpy as np
+# added by mika_jpd
+from browserforge.headers import HeaderGenerator, Browser
 
 
 class NoAccountError(Exception):
@@ -240,9 +242,13 @@ class AccountsPool:
         qs = "UPDATE accounts SET locks = json_object()"
         await execute(self._db_file, qs)
 
-    async def set_active(self, username: str, active: bool):
-        qs = "UPDATE accounts SET active = :active WHERE username = :username"
-        await execute(self._db_file, qs, {"username": username, "active": active})
+    async def set_active(self, username: str, active: bool, error_msg: str = None):
+        qs = """
+        UPDATE accounts SET 
+            active = :active, error_msg = :error_msg
+        WHERE username = :username
+        """
+        await execute(self._db_file, qs, {"username": username, "active": active, "error_msg": error_msg})
 
     async def lock_until(self, username: str, queue: str, unlock_at: int, req_count=0):
         #  added by mika_jpd (added the )
@@ -279,7 +285,6 @@ class AccountsPool:
         else:
             lock_until = 15 * 60  # 15 minutes in seconds
 
-        # Todo update the number of calls
         if int(sqlite3.sqlite_version_info[1]) >= 35:
             qs = f"""
             UPDATE accounts SET
@@ -375,7 +380,6 @@ class AccountsPool:
                 await asyncio.sleep(5)  # literally when the waiting happens
                 continue
             else:
-                # Todo check if accounts needs to be humanized
                 if msg_shown:
                     logger.info(f"Continuing with account {account.username} on queue {queue}")
                 if await self._account_needs_humanization(account=account,
@@ -407,7 +411,8 @@ class AccountsPool:
 
         return None
 
-    async def mark_inactive(self, username: str, error_msg: str | None):
+    async def mark_inactive_(self, username: str, error_msg: str | None):
+        # DEPRECATED
         qs = """
         UPDATE accounts SET active = false, error_msg = :error_msg
         WHERE username = :username
@@ -483,6 +488,24 @@ class AccountsPool:
 
         return None
 
+    async def set_fingerprint(self, username: str, headers: str | dict | None = None):
+        if headers is None:
+            browsers: list = [Browser(name='firefox')]
+            headers = HeaderGenerator(
+                browser=browsers,
+                locale="en",
+                device='desktop',
+            ).generate()
+            headers = json.dumps(headers)
+        if isinstance(headers, dict):
+            headers = json.dumps(headers)
+
+        qs = f"""
+        UPDATE accounts SET headers = :headers WHERE username = :username
+        """
+        await execute(self._db_file, qs, params={"username": username, "headers": headers})
+
+
     async def set_last_login(self, username: str, last_login: int) -> None:
         qs = f"""
                     UPDATE accounts SET last_login = :last_login WHERE username = :username
@@ -522,7 +545,8 @@ class AccountsPool:
 
     async def humanize_account(self, account: Account, queue: str) -> int:
         """
-        Humanize the account and return its login status.
+        Humanize the account and return its login status (-3, -2, -1, 0, 1). Creates, uses and closes browser session
+        on its own. Also updates the cookies and user information (e.g. last login).
         :param account: the account to humanize
         :type account: Account
         :param queue: the endpoint e.g. SearchTimeline

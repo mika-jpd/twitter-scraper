@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 
 from playwright.async_api import async_playwright, Playwright
 from camoufox import AsyncCamoufox
+from browserforge.headers import Browser
 
 # custom type
 AsyncCallable = Callable[[Any, Any], Awaitable[Any]]
@@ -44,7 +45,6 @@ def process_cookies_in(cookies: dict | str, url: str = "https://x.com") -> list[
 
 
 def process_cookies_out(cookies: list[dict], url: str | None = ".x.com") -> dict:
-    # Todo: put it in dict format: everything needs to be a string, same format as accounts.db
     out_cookies = {str(c["name"]): str(c["value"]) for c in cookies if url and c["domain"] == url}
     return out_cookies
 
@@ -73,7 +73,8 @@ class HumanTwitterInteraction:
                  twofa_id: str = None,
                  browser_path: str | None = None,
                  headless=True,
-                 cookies: str | dict = None):
+                 cookies: str | dict = None,
+                 headers: dict[str, str] = None):
 
         # Twitter actions essentials
         self.headless = headless
@@ -91,6 +92,8 @@ class HumanTwitterInteraction:
             self.cookies: list[dict] = process_cookies_in(cookies)  # assume in the format of Twitter related cookies
         else:
             self.cookies = None
+        if headers is not None:
+            self.headers: dict[str, str] = headers
 
     async def __aenter__(self):
         return self
@@ -104,8 +107,12 @@ class HumanTwitterInteraction:
         start = datetime.datetime.now()
 
         # start the async context
+        user_agent: str = self.headers["User-Agent"] if "User-Agent" in self.headers else None
         async with AsyncCamoufox() as browser:
-            context = await browser.new_context(viewport={"width": 1024, "height": 768})
+            context = await browser.new_context(
+                viewport={"width": 1024, "height": 768},
+                user_agent=user_agent
+            )
 
             if self.cookies:
                 # add cookies to the context
@@ -185,7 +192,9 @@ async def humanize(acc: Account) -> HTIOutput:
             username=acc.username,
             password=acc.password,
             email=acc.email,
-            email_password=acc.email_password
+            email_password=acc.email_password,
+            cookies=acc.cookies,
+            twofa_id=acc.twofa_id
     ) as hti:
         res: HTIOutput = await hti.run_interaction()
     return res

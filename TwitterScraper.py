@@ -308,8 +308,7 @@ class TwitterScraper:
         task_instances = []
         for i in range(self.lim_browser):
             print(f"\tCreating browser {i}")
-            temp = HumanTwitterInteraction(headless=self.headless,
-                                           path_home_folder=self.path_library_folder)
+            temp = HumanTwitterInteraction(headless=self.headless)
             await temp.instantiate_browser()
             task_instances.append(temp)
 
@@ -466,9 +465,11 @@ class TwitterScraper:
             await self.api.pool.update_cookies(username=m["args"]["username"], cookies=m["results"]["cookies"])
             await self.api.pool.reset_num_calls(username=m["args"]["username"])
             if int(m["results"]["login_status"]) == 0:
-                await self.api.pool.mark_inactive(
+                await self.api.pool.set_active(
                     username=m["args"]["username"],
-                    error_msg="login status 0 when logging into all accounts before a search_scrape")
+                    error_msg="login status 0 when logging into all accounts before a search_scrape",
+                    active=False
+                )
             elif int(m["results"]["login_status"]) == -1:
                 await self.api.pool.mark_suspended(
                     username=m["args"]["username"],

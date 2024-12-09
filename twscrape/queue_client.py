@@ -103,6 +103,7 @@ class QueueClient:
         await self.pool.set_in_use(username=username, in_use=False)
 
         if login_again:
+            login_status: int = 0
             for i in range(2):
                 login_status = await self.pool.humanize_account(account=ctx.acc, queue="_close_ctx")
                 if login_status != -2:
@@ -110,13 +111,14 @@ class QueueClient:
             if login_status in [0, -1, -3, -2]:
                 err_msg: str = f"failed humanization with login_status {login_status}"
                 logger.error(f"Marking {username} inactive with error_msg: {err_msg}")
-                await self.pool.mark_inactive(username=username, error_msg=err_msg)
+                await self.pool.set_active(username=username, error_msg=err_msg, active=False)
             else:
-                logger.warning(f"Marking {username} as inactive with login status: {login_status}")
+                logger.warning(f"Marking {username} as active with login status after a second try: {login_status}")
+                await self.pool.set_active(username=username, active=True)
 
         if inactive:
             logger.error(f"Marking {username} inactive with error_msg: {msg}")
-            await self.pool.mark_inactive(username, msg)
+            await self.pool.set_active(username=username, active=False, error_msg=msg)
             return
 
         if reset_at > 0:
