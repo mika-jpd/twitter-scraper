@@ -49,14 +49,20 @@ class AccountsPool:
             self,
             db_file="accounts.db",
             login_config: LoginConfig | None = None,
-            raise_when_no_account=False):
+            raise_when_no_account=False,
+            sem: asyncio.Semaphore = None
+    ):
         self._db_file = db_file
         self._login_config = login_config or LoginConfig()
         self._raise_when_no_account = raise_when_no_account
+        self.sem = sem
 
         # added by mika_jpd
         self.endpoint_to_spread = {
-            'SearchTimeline': 35
+            'SearchTimeline': 25,
+            'UserByScreenName': 10,
+            'UserTweets': 25,
+            'UserTweetsAndReplies':20
         }
 
     async def load_from_file(self, filepath: str, line_format: str):
@@ -124,7 +130,7 @@ class AccountsPool:
             # added by mika_jpd
             num_calls=num_calls,
             in_use=False,
-            twofa_id=twofa_id,
+            #twofa_id=twofa_id,
             use_case=use_case,
             last_login=last_login
         )
@@ -146,7 +152,7 @@ class AccountsPool:
         await execute(self._db_file, qs)
 
     async def delete_inactive(self):
-        qs = "DELETE FROM accounts WHERE active = false"
+        qs = "DELETE FROM accounts WHERE active != 1"
         await execute(self._db_file, qs)
 
     async def get(self, username: str):
@@ -271,7 +277,7 @@ class AccountsPool:
         """
         await execute(self._db_file, qs, {"username": username})
 
-    async def _get_and_lock(self, queue: str, condition: str):
+    async def _get_and_lock(self, queue: str, condition: str, params: dict = None):
         # if space in condition, it's a subquery, otherwise it's username
         condition = f"({condition})" if " " in condition else f"'{condition}'"
 
@@ -281,7 +287,7 @@ class AccountsPool:
                 self.endpoint_to_spread[queue],
                 np.absolute(self.endpoint_to_spread[queue] * 0.15)
             )
-            lock_until = np.absolute(lock_until)  # time in seconds
+            lock_until = round(np.absolute(lock_until), 1)  # time in seconds
         else:
             lock_until = 15 * 60  # 15 minutes in seconds
 
@@ -295,7 +301,7 @@ class AccountsPool:
             WHERE username = {condition}
             RETURNING *
             """
-            rs = await fetchone(self._db_file, qs)
+            rs = await fetchone(self._db_file, qs, params)
         else:
             tx = uuid.uuid4().hex
             qs = f"""
@@ -307,16 +313,17 @@ class AccountsPool:
                 _tx = '{tx}'
             WHERE username = {condition}
             """
-            await execute(self._db_file, qs)
+            await execute(self._db_file, qs, params)
 
             qs = f"SELECT * FROM accounts WHERE _tx = '{tx}'"
-            rs = await fetchone(self._db_file, qs)
+            rs = await fetchone(self._db_file, qs, params)
 
         return Account.from_rs(rs) if rs else None
 
     async def get_for_queue(self, queue: str,
                             username: str = None,
-                            use_case: int = None
+                            use_case: int = None,
+                            in_use: bool = False
                             ):
         """
         Fetches a username from accounts.db.
@@ -331,9 +338,16 @@ class AccountsPool:
         """
 
         # added by mika_jpd
-        username_condition = "" if username is None else f"username = '{username}' AND"
-        use_case_condition = "" if use_case is None else f"use_case = {use_case} AND"
-        in_use_condition = f"in_use = false AND" if username is None else ""
+        username_condition = "" if username is None else f"username = :username AND"
+        use_case_condition = "" if use_case is None or username is not None else f"use_case = :use_case AND"
+        in_use_condition = f"in_use = :in_use AND" if username is None else ""
+
+        params = {
+            "username": username if username is not None else None,
+            "use_case": use_case if use_case_condition != "" else None,
+            "in_use": in_use if in_use_condition != "" else None
+        }
+        params = {k: v for k, v in params.items() if v is not None}
 
         q = f"""
         SELECT username FROM accounts
@@ -346,7 +360,7 @@ class AccountsPool:
         LIMIT 1
         """
 
-        return await self._get_and_lock(queue, q)
+        return await self._get_and_lock(queue=queue, condition=q, params=params)
 
     async def get_for_queue_or_wait(self,
                                     queue: str,
@@ -371,7 +385,7 @@ class AccountsPool:
                         logger.warning("No active accounts. Stopping...")
                         return None
                     if username:
-                        msg = f'Account {username} not available for queue "{queue}", will be available at {nat}'
+                        msg = f'Account {username} not available for queue "{queue}", will be available at {nat}, it is {datetime.now().strftime("%H:%M:%S")}'
                     else:
                         msg = f'No account available for queue "{queue}". Next available at {nat}'
                     logger.info(msg)
@@ -505,7 +519,6 @@ class AccountsPool:
         """
         await execute(self._db_file, qs, params={"username": username, "headers": headers})
 
-
     async def set_last_login(self, username: str, last_login: int) -> None:
         qs = f"""
                     UPDATE accounts SET last_login = :last_login WHERE username = :username
@@ -536,6 +549,13 @@ class AccountsPool:
         qs = f"""UPDATE accounts SET num_calls = :num_calls WHERE username = :username"""
         await execute(self._db_file, qs, {'username': username, "num_calls": num_calls})
 
+    async def set_cookies(self, username: str, cookies: dict | str) -> None:
+        if isinstance(cookies, dict):
+            cookies = json.dumps(cookies)
+
+        qs = f"""UPDATE accounts SET cookies = :cookies WHERE username = :username"""
+        await execute(self._db_file, qs, {'username': username, "cookies": cookies})
+
     async def _account_needs_humanization(self, account: Account,
                                           _num_calls_before_humanization: tuple[int, int]) -> bool:
         if account.num_calls > random.randint(*_num_calls_before_humanization):
@@ -555,7 +575,11 @@ class AccountsPool:
         :rtype: int
         """
         logger.info(f"Humanizing account {account.username} on queue {queue}.")
-        result: HTIOutput = await humanize(acc=account)
+        if self.sem:
+            async with self.sem:
+                result: HTIOutput = await humanize(acc=account)
+        else:
+            result: HTIOutput = await humanize(acc=account)
         account.last_login = result.login_status  # update the login_status
         if result.login_status == 1:  # save cookies
             logger.info(
@@ -563,5 +587,6 @@ class AccountsPool:
             account.cookies = result.cookies  # update the cookies
         else:
             logger.warning(f"Failed humanization {account.username} attempt with login status {result.login_status}")
+        account.num_calls = 0
         await self.save(account)
         return result.login_status

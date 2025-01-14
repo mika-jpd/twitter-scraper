@@ -1,8 +1,8 @@
 from TwitterScraper import TwitterScraper
-from utils.meo_api import get_seeds
-from utils.upload_to_s3 import save_files_to_s3
-from utils.seeds import sort_seeds
-from utils.folder_manipulation import open_jsonl
+from my_utils.meo_api import get_seeds
+from my_utils.folder_manipulation import open_jsonl
+from twscrape.models import Tweet, parse_tweets
+from twscrape.logger import logger
 
 import configparser
 import sys
@@ -12,6 +12,7 @@ from pathlib import Path
 import datetime
 import os
 import json
+import random
 
 
 def bin_date_range(start_date: datetime.datetime,
@@ -43,6 +44,54 @@ def bin_date_range(start_date: datetime.datetime,
     binned_range.append(end_date)
     binned_range = sorted(list(set(binned_range)))
     return binned_range
+
+
+def sort_seeds(handles: list[dict[str, str]], path_setup: str) -> list[dict[str, str]]:
+    """
+    Parameters
+    ----------
+    handles : list[dict[str, str]]
+        The handles needed to be sorted
+    path_setup : str
+        Where to find the dict which has the seed ordering
+    Returns
+    -------
+        list[dict[str, str]]
+    """
+    with open(os.path.join(path_setup, "account_id_tweets_per_day.json"), "r") as f:
+        seed_tweets_per_day = json.load(f)
+        # if the ID isn't in the tweets per day JSON then assume it's a killer
+        return sorted(
+            handles,
+            key=lambda x: seed_tweets_per_day[str(x["SeedID"])]
+            if str(x["SeedID"]) in seed_tweets_per_day.keys()
+            else 0,
+            reverse=True
+        )
+
+
+def date_stopping_condition(res, min_date) -> bool:
+    min_date = datetime.datetime.strptime(min_date, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
+    tweets: list[Tweet] = [t for t in parse_tweets(res)]
+    # remove original retweet/quote tweets by the same user
+    rt_tweets = [t.retweetedTweet.id for t in tweets if t.retweetedTweet]
+    qt_tweets = [t.quotedTweet.id for t in tweets if t.quotedTweet]
+
+    tweets = [t for t in tweets if (t.id not in rt_tweets) and (t.id not in qt_tweets)]
+
+    # remove the pinned tweet
+    if len(tweets) > 1:
+        pinned_tweets = random.sample(tweets[1:], 1).pop().user.pinnedIds
+        tweets = [t for t in tweets if t.id not in pinned_tweets]
+
+        # filter tweets by date
+        tweets = [t for t in tweets if t.date < min_date]
+        if len(tweets) > 0:
+            return True
+        else:
+            return False
+    else:
+        return False
 
 
 def historical_twitter_scrape(config: configparser):
@@ -109,7 +158,7 @@ def historical_twitter_scrape(config: configparser):
     )
     handles = sort_seeds(handles, path_setup)
 
-    try:
+    try:  # data
         data_dir = config['path']['data']
     except KeyError:
         data_dir = os.path.join('data', f'twitter_{start_date}_{end_date}')
@@ -128,6 +177,12 @@ def historical_twitter_scrape(config: configparser):
         os.mkdir(path_output_data)
     if not os.path.exists(path_logs):
         os.mkdir(path_logs)
+
+    # scraping method
+    try:
+        scrape_method = config['scrape_type']['method']
+    except KeyError:
+        scrape_method = "search"
 
     print(f"\t- home_dir: {home_dir}")
     print(f"\t- library_dir: {library_dir}")
@@ -154,27 +209,56 @@ def historical_twitter_scrape(config: configparser):
     )
 
     queries = []
-
     for h in handles:
-        for start, end in date_ranges:
-            query = f'from:handle include:nativeretweets include:retweets until:{end} since:{start}'
+        if scrape_method == "timeline":
+            query = int(h["twitter-id"])  # or whatever you'll add as the twitter ID
             queries.append(
-                {"query": query.replace("handle", h["Handle"]),
+                {"query": query,
                  "path": os.path.join(path_output_data,
                                       f"{h['ID']}_{h['SeedID']}_{h['Collection'].replace('_', '-')}_{h['Handle'].replace('_', '-')}_{start_date}_{end_date}.jsonl"),
                  "seed_info": h,
                  "start_date": start_date,
-                 "end_date": end_date
+                 "end_date": end_date,
+                 "stopping_condition": lambda x: date_stopping_condition(x, start_date)
                  }
             )
+        elif scrape_method == "search":
+            for start, end in date_ranges:
+                query = f'from:handle include:nativeretweets include:retweets until:{end} since:{start}'
+                query = query.replace("handle", h["Handle"])
+                queries.append(
+                    {"query": query,
+                     "path": os.path.join(path_output_data,
+                                          f"{h['ID']}_{h['SeedID']}_{h['Collection'].replace('_', '-')}_{h['Handle'].replace('_', '-')}_{start_date}_{end_date}.jsonl"),
+                     "seed_info": h,
+                     "start_date": start_date,
+                     "end_date": end_date
+                     }
+                )
+        else:
+            raise ValueError(f"Scrape method must either be timeline or search !")
 
     # filter out the queries
     queries = [i for i in queries if not os.path.exists(i["path"])]
 
     # run it
-    scrape_meta_data: dict = asyncio.run(scraper.search_scrape(queries=queries, use_case=use_case))
-
+    if scrape_method == "timeline":
+        scrape_meta_data: dict = asyncio.run(
+            scraper.user_tweets_scrape(
+                queries=queries
+            )
+        )
+    elif scrape_method == "search":
+        scrape_meta_data: dict = asyncio.run(
+            scraper.search_queries_scrape(
+                queries=queries
+            )
+        )
+    else:
+        raise ValueError(f"Scrape method must either be timeline or search !")
     # show meta-data
+    for k, v in scrape_meta_data["post_scraping_accounts"].items():
+        logger.info(f"{k}: active {v}")
     """for key, value in scrape_meta_data.items():
         print(f"{key}")
         if isinstance(value, dict):
@@ -184,6 +268,7 @@ def historical_twitter_scrape(config: configparser):
             print(f"\t{value}")"""
 
     return scrape_meta_data
+
 
 def scrape_twitter():
     load_dotenv()
@@ -207,6 +292,7 @@ def scrape_twitter():
     os.environ["S3META_FOLDER"] = config["s3paths"]["meta-folder"]
 
     historical_twitter_scrape(config=config)
+
 
 if __name__ == "__main__":
     scrape_twitter()

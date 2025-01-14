@@ -3,6 +3,7 @@ import os
 from typing import Any
 import numpy as np
 import datetime
+import random
 
 import httpx
 from httpx import AsyncClient, Response
@@ -84,12 +85,10 @@ class QueueClient:
         self._num_calls_before_humanization: tuple[int, int] = _num_calls_before_humanization
 
     async def __aenter__(self):
-        await self._get_ctx()
+        await self._get_ctx() #Todo: double check if this is actually good.
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        # Todo mark account as no longer in use
-        await self.pool.set_in_use(username=self.ctx.acc.username, in_use=False)
         await self._close_ctx()
 
     async def _close_ctx(self, reset_at=-1, inactive=False, msg: str | None = None, login_again: bool = False):
@@ -102,19 +101,21 @@ class QueueClient:
 
         await self.pool.set_in_use(username=username, in_use=False)
 
-        if login_again:
+        if (login_again) and (not ctx.acc.last_login == -2) and (not inactive): # for the case where you're sending the account after a request error
             login_status: int = 0
             for i in range(2):
                 login_status = await self.pool.humanize_account(account=ctx.acc, queue="_close_ctx")
                 if login_status != -2:
                     break
-            if login_status in [0, -1, -3, -2]:
+            await self.pool.set_last_login(username=username, last_login=login_status)
+            if login_status != 1:
                 err_msg: str = f"failed humanization with login_status {login_status}"
                 logger.error(f"Marking {username} inactive with error_msg: {err_msg}")
                 await self.pool.set_active(username=username, error_msg=err_msg, active=False)
             else:
                 logger.warning(f"Marking {username} as active with login status after a second try: {login_status}")
                 await self.pool.set_active(username=username, active=True)
+                inactive = False
 
         if inactive:
             logger.error(f"Marking {username} inactive with error_msg: {msg}")
@@ -128,11 +129,12 @@ class QueueClient:
             await self.pool.unlock(username, self.queue, ctx.req_count)
 
     async def _get_ctx(self):
-        # Todo ask for a username, use_case here, humanization freq
+
         if self.ctx:
             acc = await self.pool.get_for_queue_or_wait(
                 queue=self.queue, username=self.ctx.acc.username,
-                _num_calls_before_humanization=self._num_calls_before_humanization
+                _num_calls_before_humanization=self._num_calls_before_humanization,
+                use_case=self.use_case
             )  # get the same account
             if acc:
                 self.ctx.acc = acc
@@ -179,25 +181,48 @@ class QueueClient:
         max_date: str | None = None
         top_users: str | None = None
         total_tweets: int | None = None
+        user_id = None
+        username = None
+        screen_name = None
 
         try:
-            if self.queue in ['SearchTimeline']: # parse tweets
-                parsed_tweets = [i for i in parse_tweets(rep, -1)]
-                dates = [i.date for i in parsed_tweets]
-                users = [i.user.username for i in parsed_tweets]
+            if self.queue in ['SearchTimeline', 'UserTweets', 'UserTweetsAndReplies'] and rep.status_code == 200: # parse tweets
+                tweets = [i for i in parse_tweets(rep, -1)]
+
+                # remove the original quoted and RT tweets
+                rt_tweets = [t.retweetedTweet.id for t in tweets if t.retweetedTweet]
+                qt_tweets = [t.quotedTweet.id for t in tweets if t.quotedTweet]
+                tweets = [t for t in tweets if (t.id not in rt_tweets) and (t.id not in qt_tweets)]
+
+                # remove pinned tweet
+                if len(tweets) > 1:
+                    pinned_tweets = random.sample(tweets[1:], 1).pop().user.pinnedIds
+                    tweets = [t for t in tweets if t.id not in pinned_tweets]
+
+                # fetch the dates and users
+                dates = [i.date for i in tweets]
+                users = [i.user.username for i in tweets]
 
                 # fetch some stats
-                total_tweets = len(parsed_tweets)
+                total_tweets = len(tweets)
                 min_date = min(dates).strftime("%d/%m/%Y-%H:%M:%S")
                 max_date = max(dates).strftime("%d/%m/%Y-%H:%M:%S")
                 top_user_values, top_user_count = np.unique(users, return_counts=True)
                 top_users = "".join([f"{v} ({c}) " for v, c in zip(top_user_values, top_user_count)]).rstrip()
-
-        except ValueError:
-            pass
-
-        log_msg = (f"{rep.status_code:3d} - {req_id(rep)} - {err_msg} - Collected {total_tweets} tweets from {top_users} "
-                   f"between {min_date} & {max_date}").rstrip()
+            elif self.queue in ["UserByScreenName"] and rep.status_code == 200:
+                user = parse_user(rep)
+                user_id = user.id_str
+                username = user.username
+                screen_name = user.displayname
+        except Exception as e:
+            logger.warning(f"Error {e} while parsing with bot account {self.ctx.acc.username} for queue: {self.queue}")
+        if self.queue in ['SearchTimeline', 'UserTweets', 'UserTweetsAndReplies']:
+            msg = f"Collected {total_tweets} tweets from {top_users} between {min_date} & {max_date}"
+        elif self.queue in ['UserByScreenName']:
+            msg = f"Fetched user {username} with ID {user_id} and screename {screen_name}"
+        else:
+            msg = "Unknown queue"
+        log_msg = (f"{rep.status_code:3d} - {req_id(rep)} - {err_msg} - " + msg).rstrip()
 
         logger.info(log_msg)
 
@@ -231,7 +256,7 @@ class QueueClient:
 
         if err_msg == "OK" and rep.status_code == 403:
             logger.warning(f"Session expired or banned: {log_msg}")
-            await self._close_ctx(-1, inactive=True, msg=None)
+            await self._close_ctx(-1, inactive=True, msg=None, login_again=True)
             raise HandledError()
 
         # something from twitter side - abort all queries, see: https://github.com/vladkens/twscrape/pull/80

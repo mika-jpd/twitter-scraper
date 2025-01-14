@@ -3,7 +3,8 @@ from playwright.async_api._generated import Page, Locator
 from playwright._impl._errors import TimeoutError
 from playwright.async_api import expect
 from typing import Callable
-from scraping_utils.email import get_verification_code, get_verification_code_imap, get_authentication_code, get_authentication_code_imap
+from .scraping_utils.email import get_verification_code, get_verification_code_imap, get_authentication_code, \
+    get_authentication_code_imap
 import asyncio
 import random
 import httpx
@@ -11,6 +12,7 @@ import numpy as np
 from typing import Awaitable, Any
 
 AsyncCallable = Callable[[Any, Any], Awaitable[Any]]
+
 
 def retry(max_tries: int = 3,
           sleep: float = 1,
@@ -31,9 +33,7 @@ def retry(max_tries: int = 3,
                     await asyncio.sleep(pause)
             else:
                 return False
-
         return wrapper
-
     return decorator
 
 
@@ -46,8 +46,8 @@ class TwitterActions:
         global g_username
         g_username = self.username
 
-
     # login related methods
+    @retry()
     async def login(self,
                     username: str,
                     password: str,
@@ -62,24 +62,30 @@ class TwitterActions:
             * -1 if the account has been suspended
             * -2 if the login failed for unknown reason
             * -3 too many login attempts
+            * -4 suspicious login prevented
         """
         await self.page.goto("https://x.com")
         await asyncio.sleep(2)
+        await self.check_got_it_message()
 
         # check if you've logged in
         if await self.check_login_success():
             await self.check_got_it_message()
             return 1
         else:
-            # manual login
-            manual_login_success: int = await self.login_manually(username=username,
-                                                                  password=password,
-                                                                  email=email,
-                                                                  email_password=email_password,
-                                                                  twofa_id=twofa_id)
-            if manual_login_success == 1:
-                await self.check_got_it_message()
-            return manual_login_success
+            try:
+                logger.info(f"{username}: attempting manual login.")
+                # manual login
+                manual_login_success: int = await self.login_manually(username=username,
+                                                                      password=password,
+                                                                      email=email,
+                                                                      email_password=email_password,
+                                                                      twofa_id=twofa_id)
+                if manual_login_success == 1:
+                    await self.check_got_it_message()
+                return manual_login_success
+            except Exception as e:
+                return -2
 
     async def login_manually(self,
                              username: str,
@@ -95,8 +101,9 @@ class TwitterActions:
         await self.page.get_by_text('Next').click()
         await asyncio.sleep(random.uniform(10, 20) / 10)
 
-        # check if need to put in email
-        phone_or_username_button: bool = await self.expect_locator_visible_bool(self.page.get_by_text('Phone or username'), timeout=3000)
+        # check if you need to put in email
+        phone_or_username_button: bool = await self.expect_locator_visible_bool(
+            self.page.get_by_text('Phone or username'), timeout=3000)
         if phone_or_username_button:
             await self.page.locator('input[data-testid="ocfEnterTextTextInput"]').type(username, delay=100)
             await asyncio.sleep(random.uniform(10, 20) / 10)
@@ -113,6 +120,11 @@ class TwitterActions:
         if account_locked:
             return 0
 
+        # check if 'suspicious login prevented'
+        suspicious_login_prevented = await self.check_login_prevented_suspicious_activity()
+        if suspicious_login_prevented:
+            return -3
+
         # continue with the password
         await self.page.locator('input[autocomplete="current-password"]').type(password, delay=100)
         await asyncio.sleep(random.uniform(10, 20) / 10)
@@ -120,7 +132,8 @@ class TwitterActions:
         await asyncio.sleep(random.uniform(10, 20) / 5)
 
         # potentially complete with 2fa
-        two_fa_code = await self.expect_locator_visible_bool(self.page.get_by_text("Enter your verification code"), timeout=3000)
+        two_fa_code = await self.expect_locator_visible_bool(self.page.get_by_text("Enter your verification code"),
+                                                             timeout=3000)
         if two_fa_code:
             if twofa_id == None:
                 logger.warning(f"{self.username}/: 2fa link required")
@@ -139,7 +152,6 @@ class TwitterActions:
         check_login = await self.check_login(username=username,
                                              password=password, email=email,
                                              email_password=email_password)
-        logger.info(f"{self.username}: manual login status {check_login}")
         return check_login
 
     async def input_2fa_code(self, twofa_id: str) -> bool:
@@ -195,7 +207,8 @@ class TwitterActions:
         return await self.expect_locator_visible_bool(self.page.get_by_test_id(test_id="loginButton"))
 
     async def check_login_exceed_login_attempts(self) -> bool:
-        return await self.expect_locator_visible_bool(self.page.get_by_text(text="You have exceeded the number of allowed attempts"))
+        return await self.expect_locator_visible_bool(
+            self.page.get_by_text(text="You have exceeded the number of allowed attempts"))
 
     async def check_login_prevented_suspicious_activity(self) -> bool:
         return await self.expect_locator_visible_bool(self.page.get_by_text("Suspicious login prevented"))
@@ -217,15 +230,18 @@ class TwitterActions:
         text_3 = "We sent your verification code"
         dom_3 = 'input[placeholder="Enter Verification Code"]'
 
-        check = await self.expect_locator_visible_bool(self.page.get_by_text(text)) and await self.expect_locator_visible_bool(self.page.locator(dom))
+        check = await self.expect_locator_visible_bool(
+            self.page.get_by_text(text)) and await self.expect_locator_visible_bool(self.page.locator(dom))
         if check:
             return True
 
-        check = await self.expect_locator_visible_bool(self.page.get_by_text(text_2)) and await self.expect_locator_visible_bool(self.page.locator(dom_2))
+        check = await self.expect_locator_visible_bool(
+            self.page.get_by_text(text_2)) and await self.expect_locator_visible_bool(self.page.locator(dom_2))
         if check:
             return True
 
-        check = await self.expect_locator_visible_bool(self.page.get_by_text(text_3)) and await self.expect_locator_visible_bool(self.page.locator(dom_3))
+        check = await self.expect_locator_visible_bool(
+            self.page.get_by_text(text_3)) and await self.expect_locator_visible_bool(self.page.locator(dom_3))
         if check:
             return True
 
@@ -242,7 +258,8 @@ class TwitterActions:
                 await dom_send_email.click()
 
             email_type: str
-            if await self.expect_locator_visible_bool(self.page.locator('input[placeholder="Enter Verification Code"]'), timeout=1000):
+            if await self.expect_locator_visible_bool(self.page.locator('input[placeholder="Enter Verification Code"]'),
+                                                      timeout=1000):
                 email_type = "verification"
             else:
                 email_type = "authentication"
@@ -381,7 +398,9 @@ class TwitterActions:
     @retry()
     async def get_homepage(self) -> Locator:
         await self.page.goto('https://x.com')
-        locator: Locator = self.page.locator("div[aria-label='Timeline: Your Home Timeline'] div[data-testid='cellInnerDiv']").first
+        await self.check_got_it_message()
+        locator: Locator = self.page.locator(
+            "div[aria-label='Timeline: Your Home Timeline'] div[data-testid='cellInnerDiv']").first
         await self.expect_locator_visible_bool(locator)
         return locator
 
@@ -400,6 +419,7 @@ class TwitterActions:
 
     @retry()
     async def follow_back(self, name: str = "follow_back", progress: dict = None) -> bool:
+        await self.check_got_it_message()
         if progress and name in progress.keys():
             progress[name]["attempts"] = progress[name]["attempts"] + 1
 
@@ -407,7 +427,7 @@ class TwitterActions:
         await self.page.goto(f"https://x.com/{self.username}/followers")
 
         # scroll
-        #await self.page.mouse.wheel(delta_x=0, delta_y=200)
+        # await self.page.mouse.wheel(delta_x=0, delta_y=200)
         await asyncio.sleep(random.randint(10, 22) / 10)
 
         # get followers
@@ -430,6 +450,7 @@ class TwitterActions:
 
     @retry()
     async def retweet(self, name: str = "retweet", progress: dict = None, num_retweets: int = 2) -> bool:
+        await self.check_got_it_message()
         if progress and name in progress.keys():
             progress[name]["attempts"] = progress[name]["attempts"] + 1
 
@@ -462,6 +483,7 @@ class TwitterActions:
 
     @retry()
     async def like(self, name="like", num_likes: int = 2, progress: dict = None) -> bool:
+        await self.check_got_it_message()
         if progress and name in progress.keys():
             progress[name]["attempts"] = progress[name]["attempts"] + 1
 
@@ -488,8 +510,9 @@ class TwitterActions:
 
     async def message(self) -> bool:
         return True
-
+    @retry()
     async def view_trending(self, name: str = "view_trending", progress: dict = None) -> bool:
+        await self.check_got_it_message()
         if progress and name in progress.keys():
             progress[name]["attempts"] = progress[name]["attempts"] + 1
 
@@ -519,8 +542,9 @@ class TwitterActions:
         # 3. scroll randomly
         await self.scroll()
         return True
-
+    @retry()
     async def view_messages(self, name: str = "view_messages", progress: dict = None) -> bool:
+        await self.check_got_it_message()
         if progress and name in progress.keys():
             progress[name]["attempts"] = progress[name]["attempts"] + 1
 
@@ -536,8 +560,9 @@ class TwitterActions:
         await self.scroll(lim=2)
 
         return True
-
+    @retry()
     async def view_homepage(self, name: str = "view_homepage", progress: dict = None) -> bool:
+        await self.check_got_it_message()
         if progress and name in progress.keys():
             progress[name]["attempts"] = progress[name]["attempts"] + 1
         await self.get_homepage()
@@ -548,6 +573,8 @@ class TwitterActions:
         got_it_butn = self.page.get_by_text("Got it")
         if await self.expect_locator_visible_bool(got_it_butn, timeout=2000):
             await got_it_butn.click()
+        else:
+            pass
 
     async def expect_locator_visible_bool(self, loc: Locator, timeout: int = 5000) -> bool:
         try:

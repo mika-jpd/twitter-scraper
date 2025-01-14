@@ -31,7 +31,6 @@ class Account(JSONTrait):
 
     # added by mika_jpd
     in_use: bool = False
-    twofa_id: str | None = None
     use_case: int | None = None
     last_login: int | None = None
     num_calls: int | None = None
@@ -52,7 +51,7 @@ class Account(JSONTrait):
 
     def to_rs(self):
         rs = asdict(self)
-        rs["locks"] = json.dumps(rs["locks"], default=lambda x: x.isoformat())
+        rs["locks"] = json.dumps(rs["locks"], default=lambda x: x.isoformat(sep=" "))
         rs["stats"] = json.dumps(rs["stats"])
         rs["headers"] = json.dumps(rs["headers"])
         rs["cookies"] = json.dumps(rs["cookies"])

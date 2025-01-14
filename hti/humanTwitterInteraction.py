@@ -2,7 +2,7 @@
 from my_utils.logger.logger import logger
 
 # local
-from twitterActions import TwitterActions
+from .twitterActions import TwitterActions
 from twscrape.account import Account
 
 import os
@@ -21,10 +21,12 @@ import datetime
 import re
 from dataclasses import dataclass, asdict
 from dotenv import load_dotenv
+import sqlite3
 
 from playwright.async_api import async_playwright, Playwright
 from camoufox import AsyncCamoufox
 from browserforge.headers import Browser
+from browserforge.fingerprints import Screen
 
 # custom type
 AsyncCallable = Callable[[Any, Any], Awaitable[Any]]
@@ -45,7 +47,7 @@ def process_cookies_in(cookies: dict | str, url: str = "https://x.com") -> list[
 
 
 def process_cookies_out(cookies: list[dict], url: str | None = ".x.com") -> dict:
-    out_cookies = {str(c["name"]): str(c["value"]) for c in cookies if url and c["domain"] == url}
+    out_cookies = {str(c["name"]): str(c["value"]) for c in cookies if url and "domain" in c and c["domain"] == url}
     return out_cookies
 
 
@@ -72,7 +74,7 @@ class HumanTwitterInteraction:
                  email_password: str,
                  twofa_id: str = None,
                  browser_path: str | None = None,
-                 headless=True,
+                 headless: bool | str = True,
                  cookies: str | dict = None,
                  headers: dict[str, str] = None):
 
@@ -92,8 +94,7 @@ class HumanTwitterInteraction:
             self.cookies: list[dict] = process_cookies_in(cookies)  # assume in the format of Twitter related cookies
         else:
             self.cookies = None
-        if headers is not None:
-            self.headers: dict[str, str] = headers
+        self.headers = headers
 
     async def __aenter__(self):
         return self
@@ -107,8 +108,13 @@ class HumanTwitterInteraction:
         start = datetime.datetime.now()
 
         # start the async context
-        user_agent: str = self.headers["User-Agent"] if "User-Agent" in self.headers else None
-        async with AsyncCamoufox() as browser:
+        user_agent: str = self.headers["User-Agent"] if self.headers and "User-Agent" in self.headers else None
+        #screen = Screen(max_width=1024, max_height=768) if not self.headless else None
+        async with AsyncCamoufox(
+                #screen=screen,
+                humanize=True,
+                headless=self.headless
+        ) as browser:
             context = await browser.new_context(
                 viewport={"width": 1024, "height": 768},
                 user_agent=user_agent
@@ -138,7 +144,7 @@ class HumanTwitterInteraction:
                                          email=self.email,
                                          email_password=self.email_password,
                                          twofa_id=self.twofa_id)
-
+            logger.info(f"{self.username}: login status: {log}")
             if log == 1:
                 # do things in list
                 for func_name, func_callable in activities.items():
@@ -156,7 +162,7 @@ class HumanTwitterInteraction:
             start_time=start.strftime('%Y-%m-%d %H:%M:%S'),
             end_time=end.strftime('%Y-%m-%d %H:%M:'),
             total_time=(end - start).total_seconds(),
-            login_status=log,
+            login_status=log if log is not None else -2,
             activities=progress,
             cookies=process_cookies_out(self.cookies) if self.cookies else {},
             humanization_status=True if log == 1 else False
@@ -187,16 +193,30 @@ class HumanTwitterInteraction:
         return activities
 
 
-async def humanize(acc: Account) -> HTIOutput:
-    async with HumanTwitterInteraction(
-            username=acc.username,
-            password=acc.password,
-            email=acc.email,
-            email_password=acc.email_password,
-            cookies=acc.cookies,
-            twofa_id=acc.twofa_id
-    ) as hti:
-        res: HTIOutput = await hti.run_interaction()
+async def humanize(acc: Account, size: int = None, headless: bool = True, sem: asyncio.Semaphore = None) -> HTIOutput:
+    if sem:
+        async with sem:
+            async with HumanTwitterInteraction(
+                    username=acc.username,
+                    password=acc.password,
+                    email=acc.email,
+                    email_password=acc.email_password,
+                    cookies=acc.cookies,
+                    twofa_id=acc.mfa_code,
+                    headers=acc.headers,
+                    headless=headless) as hti:
+                res: HTIOutput = await hti.run_interaction(size=size)
+    else:
+        async with HumanTwitterInteraction(
+                username=acc.username,
+                password=acc.password,
+                email=acc.email,
+                email_password=acc.email_password,
+                cookies=acc.cookies,
+                twofa_id=acc.mfa_code,
+                headers=acc.headers,
+                headless=headless) as hti:
+            res: HTIOutput = await hti.run_interaction(size=size)
     return res
 
 
@@ -206,7 +226,8 @@ async def main():
             password="Azertyuiop180600!",
             email="flumpy180600@gmail.com",
             email_password="Mika180600!",
-            cookies={}
+            cookies={},
+            headless=True
     ) as hti:
         res: HTIOutput = await hti.run_interaction()
         res: dict = res.dict()

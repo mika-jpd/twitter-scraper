@@ -1,24 +1,29 @@
 # local
 from twscrape.api import API
 from twscrape.utils import gather
-from utils.asyncHumanTaskManager import AsyncHumanTaskManager
-from utils.exceptions import NoAccountsAvailable
-from utils.upload_to_s3 import upload_to_s3
-from utils.folder_manipulation import save_to_jsonl
-from utils.logger import logger
-from utils.meo_api import update_crawler_history
-from utils.accounts import fetch_accounts
-from hti import HumanTwitterInteraction
+from twscrape.account import Account
+from twscrape.db import fetchall, fetchone, execute
+from twscrape import API, gather, Tweet
+from twscrape.models import parse_tweets
+from my_utils.upload_to_s3 import upload_to_s3
+from my_utils.upload_to_s3.upload_to_s3 import upload_to_s3
+from my_utils.folder_manipulation import save_to_jsonl
+from my_utils.logger import logger
+from my_utils.meo_api import update_crawler_history
+from hti import HumanTwitterInteraction, HTIOutput
 
-from asyncio import Queue, Future, Task
+from asyncio import Queue, Future, Task, Semaphore
 import asyncio
-from typing import Callable, Any
+from typing import Callable, Any, Iterable, Awaitable
 import time
 import os
 from dotenv import load_dotenv
 import requests
 import datetime
 from thefuzz import fuzz
+import random
+
+AsyncCallable = Callable[[Any, Any], Awaitable[Any]]
 
 
 def change_to_new_format(data: list[dict], seed_info: dict, force_collection: bool = False) -> list[dict]:
@@ -58,9 +63,11 @@ def change_to_new_format(data: list[dict], seed_info: dict, force_collection: bo
         else:
             ratio = fuzz.ratio(tweet['user']['username'].lower(), handle.lower())
             if ratio > 70 and ratio < 80:
-                logger.warning(f"SeedID set to 0 for tweet {tweet['user']['username'].lower()} and seed {handle.lower()} with ratio {ratio}")
+                logger.warning(
+                    f"SeedID set to 0 for tweet {tweet['user']['username'].lower()} and seed {handle.lower()} with ratio {ratio}")
             elif ratio > 80:
-                logger.error(f"SeedID set to 0 for tweet {tweet['user']['username'].lower()} and seed {handle.lower()} with ratio {ratio}")
+                logger.error(
+                    f"SeedID set to 0 for tweet {tweet['user']['username'].lower()} and seed {handle.lower()} with ratio {ratio}")
             new_format = {
                 "phh_id": "0",
                 "seed_id": "0",
@@ -70,6 +77,20 @@ def change_to_new_format(data: list[dict], seed_info: dict, force_collection: bo
             }
         tweets_new_format.append(new_format)
     return tweets_new_format
+
+
+def get_user_tweets_only(tweets: list[Tweet]) -> list[Tweet]:
+    # remove original retweet/quote tweets by the same user
+    rt_tweets = [t.retweetedTweet.id for t in tweets if t.retweetedTweet]
+    qt_tweets = [t.quotedTweet.id for t in tweets if t.quotedTweet]
+
+    tweets = [t for t in tweets if (t.id not in rt_tweets) and (t.id not in qt_tweets)]
+
+    # remove the pinned tweet (there's a better way to do this)
+    if len(tweets) > 1:
+        pinned_tweets = random.sample(tweets, 1).pop().user.pinnedIds
+        tweets = [t for t in tweets if t.id not in pinned_tweets]
+    return tweets
 
 
 class TwitterScraper:
@@ -83,26 +104,41 @@ class TwitterScraper:
 
         self.headless = headless
         self.use_case = use_case
+
         # paths
         self.path_library_folder = path_library_folder
         self.path_setup = setup_path
 
+        # can probably just use the pool methods for this...
         if self.use_case is not None:
             # set lim_acc to the number of active accounts
-            self.active_accounts: list[dict] = fetch_accounts(
-                query=f"""SELECT * FROM accounts WHERE active=true AND use_case={use_case}""",
-                path=os.path.join(self.path_library_folder, "accounts.db")
+            self.active_accounts: list[dict] = asyncio.run(
+                fetchall(
+                    query=f"""SELECT * FROM accounts WHERE active=true AND use_case={use_case}""",
+                    path=os.path.join(self.path_library_folder, "accounts.db")
+                )
             )
         else:
-            self.active_accounts: list[dict] = fetch_accounts(
-                query=f"""SELECT * FROM accounts WHERE active=true""",
-                path=os.path.join(self.path_library_folder, "accounts.db")
+            self.active_accounts: list[dict] = asyncio.run(
+                fetchall(
+                    query=f"""SELECT * FROM accounts WHERE active=true""",
+                    path=os.path.join(self.path_library_folder, "accounts.db")
+                )
             )
+
+        try:
+            # there's already an event loop
+            event_loop = asyncio.get_running_loop()
+            event_loop.run_until_complete(self.instantiate_twscrape_api())
+        except RuntimeError:
+            # no event loop running
+            asyncio.run(self.instantiate_twscrape_api())
 
         substract = (len(self.active_accounts) - 5)
         substract = substract if substract >= 0 else lim_acc
         self.lim_acc = min(lim_acc, substract)
         self.lim_browser = min(lim_browser, self.lim_acc)
+        self.sem: asyncio.Semaphore = asyncio.Semaphore(self.lim_browser)
 
         # instantiate when you scrape
         self.api = None
@@ -113,19 +149,19 @@ class TwitterScraper:
         logger.info(f"Number of worker accounts: {self.lim_acc}")
         logger.info(f"Number of browser instances: {self.lim_browser}")
 
-    async def search_twscrape_and_save(self,
-                                       query: str,
-                                       path: str,
-                                       seed_info: dict,
-                                       start_date: str,
-                                       end_date: str,
-                                       limit: int = -1,
-                                       update_phh_history: bool = True,
-                                       force_collection: bool = False,
-                                       bool_upload_to_s3: bool = True,
-                                       bool_change_to_new_format: bool = True) -> None:
-        data = await self.search_twscrape(query=query, limit=limit)
-        logger.info(f"Saving data from {query} to {path} with new_format set to {bool_change_to_new_format}, s3 {bool_upload_to_s3} and update_phh_history {update_phh_history}.")
+    async def save(self,
+                   data: Iterable,
+                   path: str,
+                   seed_info: dict,
+                   start_date: str,
+                   end_date: str,
+                   update_phh_history: bool = True,
+                   force_collection: bool = False,
+                   bool_upload_to_s3: bool = True,
+                   bool_change_to_new_format: bool = True
+                   ):
+        logger.info(
+            f"Saving data from {seed_info['Handle']} to {path} with new_format set to {bool_change_to_new_format}, s3 {bool_upload_to_s3} and update_phh_history {update_phh_history}.")
         data = [t.dict() if not isinstance(t, dict) else t for t in data]
 
         if bool_change_to_new_format:
@@ -149,15 +185,114 @@ class TwitterScraper:
                 start_date=start_date,
                 end_date=end_date
             )
+        return data
+
+    async def search_twscrape_and_save(self,
+                                       query: str,
+                                       path: str,
+                                       seed_info: dict,
+                                       start_date: str,
+                                       end_date: str,
+                                       limit: int = -1,
+                                       update_phh_history: bool = True,
+                                       force_collection: bool = False,
+                                       bool_upload_to_s3: bool = True,
+                                       bool_change_to_new_format: bool = True,
+                                       sem: asyncio.Semaphore = None) -> list[dict] | list:
+
+        if sem:
+            async with sem:
+                data = await self.search_twscrape(query=query, limit=limit)
+        else:
+            data = await self.search_twscrape(query=query, limit=limit)
+        data = await self.save(data=data,
+                               path=path,
+                               seed_info=seed_info,
+                               start_date=start_date,
+                               end_date=end_date,
+                               update_phh_history=update_phh_history,
+                               force_collection=force_collection,
+                               bool_upload_to_s3=bool_upload_to_s3,
+                               bool_change_to_new_format=bool_change_to_new_format)
+        return data
+
+    async def user_tweets_and_replies_twscrape_and_save(self,
+                                                        uid: int,
+                                                        path: str,
+                                                        seed_info: dict,
+                                                        start_date: str,
+                                                        end_date: str,
+                                                        stopping_condition: Callable = None,
+                                                        update_phh_history: bool = True,
+                                                        force_collection: bool = False,
+                                                        bool_upload_to_s3: bool = True,
+                                                        bool_change_to_new_format: bool = True,
+                                                        sem: asyncio.Semaphore = None) -> list[dict] | list:
+        if sem:
+            async with sem:
+                data, flag = await self.user_tweets_and_replies_twscrape(uid, stopping_condition)
+        else:
+            data, flag = await self.user_tweets_and_replies_twscrape(uid, stopping_condition)
+        # check if flag went off
+        if stopping_condition and len(data) > 0:  # triggers if you scraped all the tweets in a person's timeline (1. there are tweets) & you haven't gone far back enough (2. those tweets didn't trigger stopping condition)
+            if not flag:  # then you have to do some work
+                # figure out the earliest tweet that you have
+                user_tweets: list[Tweet] = get_user_tweets_only(data)
+                # launch a search_scrape with query the start date till the latest date you have + 1
+                min_date: datetime.datetime = min(user_tweets, key=lambda x: x.date).date
+                min_date = min_date + datetime.timedelta(days=1)
+                end = min_date.strftime("%Y-%m-%d")
+
+                query = f'from:{seed_info["Handle"]} include:nativeretweets include:retweets until:{end} since:{start_date}'
+                async with sem:
+                    data = await self.search_twscrape(
+                        query=query,
+                        limit=-1
+                    )
+        # filter out the tweets that are too new or too old by
+        user_tweets: list[Tweet] = get_user_tweets_only(data)
+        user_excluded_tweets: list[Tweet] = [
+            d for d in user_tweets
+            if datetime.datetime.strptime(start_date, "%Y-%m-%d") <= d.date < datetime.datetime.strptime(end_date,
+                                                                                                         "%Y-%m-%d")
+        ]  # 1. get the user tweets that are too new or too old
+        excluded_tweets = []
+        for t in user_excluded_tweets:
+            if t.retweetedTweet is not None:  # 2.1 remove any corresponding retweetedTweet
+                excluded_tweets.append(int(t.retweetedTweet.id))
+            if t.quotedTweet is not None:  # 2.2 remove any corresponding quotedTweet
+                excluded_tweets.append(int(t.quotedTweet.id))
+            excluded_tweets.append(int(t.id))
+
+        data = [d for d in data if not int(d.id) in excluded_tweets]
+        data = await self.save(data=data,
+                               path=path,
+                               seed_info=seed_info,
+                               start_date=start_date,
+                               end_date=end_date,
+                               update_phh_history=update_phh_history,
+                               force_collection=force_collection,
+                               bool_upload_to_s3=bool_upload_to_s3,
+                               bool_change_to_new_format=bool_change_to_new_format)
+        return data
 
     async def user_by_login_twscrape(self, username: str):
         return await self.api.user_by_login(username)
 
-    async def user_tweets_and_replies_twscrape(self, uid: int):
-        return await self.api.user_tweets_and_replies(uid)
+    async def user_tweets_and_replies_twscrape(self,
+                                               uid: int,
+                                               stopping_condition: Callable = None) -> tuple[list, bool]:
+        logger.info(f'user tweets and replies for uid: {uid}')
+        flag = False
+        data = await gather(self.api.user_tweets_and_replies(uid, stopping_condition=stopping_condition, flag=flag))
+
+        # process tweets if needed
+        return data, flag
 
     async def user_tweets_twscrape(self, uid: int):
-        return await self.api.user_tweets(uid)
+        logger.info(f'user tweets for uid: {uid}')
+        data = await gather(self.api.user_tweets(uid))
+        return data
 
     async def search_twscrape(self,
                               query: str,
@@ -190,112 +325,6 @@ class TwitterScraper:
         else:
             raise ValueError("API not initialized ! Please initialize Twscrape API before running this.")
 
-    async def _process_search_results(self, t: Task, rand_name_to_filename: dict[str, str]) -> None:
-        """
-        Process search results for Twitter advanced search
-        Parameters
-        ----------
-        t : Future
-            a Future object that is marked done
-        rand_name_to_filename : dict['str', 'str']
-            a dictionary which holds the filename and path in which to store the collected tweets.
-
-        Returns
-        -------
-        None
-        """
-        t_name = t.get_name()
-        t_results = [i.dict() for i in t.result()]  # get the results
-        file_name = rand_name_to_filename[t_name]
-        await self.asyncTaskMan_acc.remove_task(t_name)
-
-        if file_name:
-            save_to_jsonl(file_name, t_results)
-        else:
-            logger.warning(f"Unable to save {len(t_results)} from {t_name} because filename is {file_name}.")
-
-    async def run_queries_async(self,
-                                queries: Queue[dict],
-                                func: Callable = None,
-                                asyncTaskMan: AsyncHumanTaskManager = None,
-                                default: bool = False) -> dict:
-        """
-        Run the queries stored in queries. The function is function and query agnostic so long
-        as the function query input matches the query itself.
-        Parameters
-        ----------
-        queries : Queue[tuple[dict, str]]
-            a queue of tuples containing
-                - dict: keyword arguments for the search function being called,
-                - str: the path to where JSON serializable objects should be saved
-        func : Callable
-            a function which takes as input the queries in queries
-        asyncTaskMan: AsyncHumanTaskManager, optional, default=None
-            an instance of the AsyncHumanTaskManager if you want to run queries not with the account task manager
-        default : bool, optional, default=False
-            whether to use the default function in the asyncTaskManager
-        Returns
-        -------
-            dict
-        """
-        if not default and func is None:
-            raise ValueError("Argument default is False and fun is None,\ncannot run non-default task if function is "
-                             "None.")
-        if not asyncTaskMan:
-            asyncTaskMan = self.asyncTaskMan_acc
-
-        next_query: dict | None = None
-
-        meta_data: dict = {
-            "total_num_queries": queries.qsize(),
-            "num_queries": 0
-        }
-        results: list[dict[str, Any]] = []
-        task_name_to_query: dict[str, Any] = {}
-        while True:
-            try:
-                accept_next_task: bool = True
-                while accept_next_task:
-                    if next_query is None:
-                        next_query = queries.get_nowait() # this is just for the first run
-                    if default:
-                        task_name = asyncTaskMan.add_default_task(**next_query)
-                    else:
-                        task_name = asyncTaskMan.add_task(async_task=func,
-                                                          **next_query)
-                    if task_name:
-                        task_name_to_query[task_name] = next_query
-                        next_query = queries.get_nowait()
-                    else:
-                        accept_next_task = False
-                done, pending = await asyncTaskMan.run_all_tasks(asyncio.FIRST_COMPLETED)
-                for t in done:
-                    meta_data["num_queries"] += 1
-                    results.append({"args": task_name_to_query[t.get_name()],  # test t.task_name
-                                    "results": t.result()})
-                    task_name_to_query.pop(t.get_name(), None)
-
-                    t_name = t.get_name()
-                    await asyncTaskMan.remove_task(t_name)
-            except NoAccountsAvailable as e:
-                logger.error(e.message)
-                break
-            except asyncio.QueueEmpty:
-                # all accounts have been scraped
-                done, pending = await asyncTaskMan.run_all_tasks(asyncio.ALL_COMPLETED)
-                for t in done:
-                    # await self._process_search_results(t, rand_name_to_filename)
-                    meta_data["num_queries"] += 1
-                    results.append({"args": task_name_to_query[t.get_name()],
-                                    "results": t.result()})
-                    task_name_to_query.pop(t.get_name(), None)
-                    if default:
-                        t_name = t.get_name()
-                        await asyncTaskMan.remove_task(t_name)
-                break
-        meta_data["results"] = results
-        return meta_data
-
     async def instantiate_twscrape_api(self):
         """
         Instantiate the account and browser task managers used respectively to organise
@@ -305,22 +334,14 @@ class TwitterScraper:
         None
         """
         # task managers & API instantiation
-        task_instances = []
-        for i in range(self.lim_browser):
-            print(f"\tCreating browser {i}")
-            temp = HumanTwitterInteraction(headless=self.headless)
-            await temp.instantiate_browser()
-            task_instances.append(temp)
 
-        self.asyncTaskMan_acc: AsyncHumanTaskManager = AsyncHumanTaskManager(num_max_task=self.lim_acc)
-        self.asyncTaskMan_browser: AsyncHumanTaskManager = AsyncHumanTaskManager(num_max_task=self.lim_browser,
-                                                                                 task_instances=task_instances)
-        self.api: API | None = API(atm_b=self.asyncTaskMan_browser,
-                                   db_file=os.path.join(self.path_library_folder, "accounts.db"),
-                                   use_case=self.use_case)
+        self.api: API | None = API(pool=os.path.join(self.path_library_folder, "accounts.db"),
+                                   use_case=self.use_case,
+                                   sem=self.sem)
+        self.active_accounts = await self.api.pool.get_active(use_case=self.use_case)
         for u in self.active_accounts:
-            username = u["username"]
-            await self.api.pool.mark_no_longer_in_use(username)
+            username = u.username
+            await self.api.pool.set_in_use(username=username, in_use=False)
 
     @staticmethod
     def twitter_api_request(url: str, params: dict) -> list[dict] | None:
@@ -434,7 +455,7 @@ class TwitterScraper:
             self.search_api_(**query)
         pass
 
-    async def login_to_all_accounts(self, use_case: int):
+    async def _login_to_all_accounts(self, use_case: int):
         if self.use_case is not None:
             queries: list[dict] = [
                 {
@@ -480,10 +501,44 @@ class TwitterScraper:
                     error_msg="login status -3 when logging into all accounts before a search_scrape")
         pass
 
-    async def search_scrape(self,
-                            queries: list[dict],
-                            use_case: int | None = 0
-                            ) -> dict:
+    async def login_to_all_accounts(self):
+        async def _login_to_account(sem: asyncio.Semaphore, acc: Account, size: int) -> HTIOutput:
+            async with sem:
+                hti = HumanTwitterInteraction(username=acc.username,
+                                              password=acc.password,
+                                              email=acc.email,
+                                              email_password=acc.email_password,
+                                              twofa_id=acc.mfa_code,
+                                              cookies=acc.cookies)
+                res = await hti.run_interaction(size=size)
+                return res
+
+        sem = asyncio.Semaphore(5)
+        queries: list[dict] = [
+            {"sem": sem, "acc": Account(**k), "size": 1} for k in self.active_accounts
+        ]
+        login_results: tuple[HTIOutput] = await asyncio.gather(*[_login_to_account(**q) for q in queries])
+
+        for out in login_results:
+            await self.api.pool.set_cookies(username=out.username, cookies=out.cookies)
+            await self.api.pool.set_num_calls(username=out.username, num_calls=0)
+            await self.api.pool.set_active(
+                username=out.username,
+                error_msg=f"login status {out.login_status} when logging into all accounts before a scrape",
+                active=True if int(out.login_status) == 1 else False
+            )
+            await self.api.pool.set_last_login(username=out.username, last_login=out.login_status)
+
+    async def search_queries_scrape(self, queries: list[dict]):
+        return self.run_scraper(queries=queries, func=self.search_twscrape_and_save)
+
+    async def user_tweets_scrape(self, queries: list[dict]):
+        return self.run_scraper(queries=queries, func=self.user_tweets_and_replies_twscrape_and_save)
+
+    async def run_scraper(self,
+                          queries: list[dict],
+                          func: Callable
+                          ) -> dict:
         logger.info(f"Scraping {len(queries)} queries")
         # scraping meta-data
         meta_data: dict = {
@@ -491,37 +546,35 @@ class TwitterScraper:
         }
         query_meta_data: dict = {}
         if len(queries) > 0:
-            queries_queue = Queue()
-            for q in queries:
-                queries_queue.put_nowait(q)
-            del queries
-
             # instantiate the API objects
             await self.instantiate_twscrape_api()
 
             # log into all accounts before starting
-            await self.login_to_all_accounts(use_case=use_case)
+            await self.login_to_all_accounts()
 
             # run with the search method
-            query_meta_data = await self.run_queries_async(func=self.search_twscrape_and_save,
-                                                           queries=queries_queue,
-                                                           default=False,
-                                                           asyncTaskMan=None)
+            sem: asyncio.Semaphore = asyncio.Semaphore(self.lim_acc)
+            scraping_results: tuple[list] = await asyncio.gather(*[func(**q, sem=sem) for q in queries])
+
+            # update meta-data
+            meta_data["total_tweets_collected"] = sum([len(i) for i in scraping_results])
+            meta_data["total_num_queries"] = len(queries)
 
         # update meta_data
         meta_data["end_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # get status of the active accounts after the query
-        query = """SELECT * FROM accounts WHERE username IN ({0})""".format(
-            ', '.join('?' for _ in self.active_accounts))
-        accounts_after: list[dict] = fetch_accounts(
-            query=query,
-            params=[i["username"] for i in self.active_accounts],
-            path=os.path.join(self.path_library_folder, "accounts.db")
+        query = """
+        SELECT * FROM accounts WHERE username IN ({0})
+        """.format(', '.join(f':{u}' for u in enumerate(self.active_accounts)))
+
+        accounts_after = await fetchall(
+            db_path=os.path.join(self.path_library_folder, "accounts.db"),
+            qs=query,
+            params={user["username"]: user["username"] for user in self.active_accounts}
         )
+
         meta_data["post_scraping_accounts"] = {dic["username"]: dic["active"] for dic in accounts_after}
-        meta_data["query_meta_data"] = query_meta_data
 
         # output scraping metadata
         return meta_data
-

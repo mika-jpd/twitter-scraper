@@ -157,6 +157,16 @@ class User(JSONTrait):
             pinnedIds=[int(x) for x in obj.get("pinned_tweet_ids_str", [])],
         )
 
+    def dict(self):
+        # descriptionLinks
+        user_dict = {k: str(v) for k, v in asdict(self).items()}
+        for k, v in user_dict.items():
+            if k == 'descriptionLinks':
+                descriptionLinks = []
+                for link in self.descriptionLinks:
+                    descriptionLinks.append(link.dict())
+                user_dict['descriptionLinks'] = descriptionLinks
+        return user_dict
 
 @dataclass
 class Tweet(JSONTrait):
@@ -264,6 +274,44 @@ class Tweet(JSONTrait):
 
         return doc
 
+    def dict(self):  # modify so that both Tweet, User, and link are dictionaries
+        tweet_dict = {k: str(v) for k, v in asdict(self).items()}
+        for k, v in tweet_dict.items():
+            if k == 'user' or k == 'retweetedTweet' or k == 'quotedTweet' or k == 'media':
+                if k == 'user':
+                    att = self.user
+                elif k == 'retweetedTweet':
+                    att = self.retweetedTweet
+                elif k == 'quotedTweet':
+                    att = self.quotedTweet
+                elif k == 'media':
+                    att = self.media
+                if att != None: tweet_dict[k] = att.dict()
+                else: tweet_dict[k] = {}
+            elif k == 'hashtags' or k == 'cashtags':
+                if k == 'hashtags':
+                    att = self.hashtags
+                elif k == 'cashtags':
+                    att = self.cashtags
+                if att != []: tweet_dict[k] = [h for h in att]
+                else: tweet_dict[k] = []
+            elif k == 'mentionedUsers' or k == 'links':
+                if k == 'mentionedUsers':
+                    att = self.mentionedUsers
+                elif k == 'links':
+                    att = self.links
+                if att != []: tweet_dict[k] = [h.dict() for h in att]
+                else: tweet_dict[k] = []
+            elif k == 'inReplyToUser' or k == 'place': # if things are already dicts
+                if k == 'inReplyToUser':
+                    att = self.inReplyToUser
+                elif k == 'place':
+                    att = self.place
+                if att is not None: tweet_dict[k] = att.dict()
+                else: tweet_dict[k] = {}
+        tweet_dict['date_scrape'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return tweet_dict
+
 
 @dataclass
 class MediaPhoto(JSONTrait):
@@ -292,6 +340,10 @@ class MediaVideo(JSONTrait):
             views=int_or(obj, "mediaStats.viewCount"),
         )
 
+    def dict(self):
+        mediaVideo_dict = {k: str(v) for k, v in asdict(self).items()}
+        mediaVideo_dict['variants'] = [v.dict() for v in self.variants]
+        return mediaVideo_dict
 
 @dataclass
 class MediaAnimated(JSONTrait):
@@ -356,6 +408,14 @@ class Media(JSONTrait):
 
         return Media(photos=photos, videos=videos, animated=animated)
 
+    def dict(self):
+        media_dict = {}
+        for att_name, att in zip(['photos', 'videos', 'animated'], [self.photos, self.videos, self.animated]):
+            sub_media_dict = []
+            for m in att:
+                sub_media_dict.append(m.dict())
+            media_dict[att_name] = sub_media_dict
+        return media_dict
 
 @dataclass
 class Card(JSONTrait):
@@ -384,6 +444,17 @@ class PollCard(Card):
     options: list[PollOption]
     finished: bool
     _type: str = "poll"
+
+    def dict(self):
+        poll_card_dict = {}
+        poll_card_dict["finished"] = self.finished
+        poll_card_dict["_type"] = self._type
+        options_list = []
+        for o in self.options:
+            options_list.append(o.dict())
+        poll_card_dict["options"] = options_list
+        return poll_card_dict
+
 
 
 @dataclass

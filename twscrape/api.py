@@ -1,4 +1,6 @@
+import asyncio
 from contextlib import aclosing
+from typing import Callable
 
 from httpx import Response
 from typing_extensions import deprecated
@@ -26,7 +28,6 @@ OP_BlueVerifiedFollowers = "cpPRJUmSz2Fiu1PpIYmEsw/BlueVerifiedFollowers"
 OP_UserCreatorSubscriptions = "qHaReNBi0rkhjAe14jrs6A/UserCreatorSubscriptions"
 OP_UserMedia = "dexO_2tohK86JDudXXG3Yw/UserMedia"
 OP_Bookmarks = "QUjXply7fA7fk05FRyajEg/Bookmarks"
-
 
 GQL_URL = "https://x.com/i/api/graphql"
 GQL_FEATURES = {  # search values here (view source) https://x.com/
@@ -64,20 +65,21 @@ class API:
     pool: AccountsPool
 
     def __init__(
-        self,
-        use_case: int = None,
-        pool: AccountsPool | str | None = None,
-        debug=False,
-        proxy: str | None = None,
-        raise_when_no_account=False,
-        _num_calls_before_humanization: tuple[int, int] = (15, 30)
+            self,
+            use_case: int = None,
+            pool: AccountsPool | str | None = None,
+            debug=False,
+            proxy: str | None = None,
+            raise_when_no_account=False,
+            _num_calls_before_humanization: tuple[int, int] = (15, 30),
+            sem: asyncio.Semaphore = None
     ):
         if isinstance(pool, AccountsPool):
             self.pool = pool
         elif isinstance(pool, str):
-            self.pool = AccountsPool(db_file=pool, raise_when_no_account=raise_when_no_account)
+            self.pool = AccountsPool(db_file=pool, raise_when_no_account=raise_when_no_account, sem=sem)
         else:
-            self.pool = AccountsPool(raise_when_no_account=raise_when_no_account)
+            self.pool = AccountsPool(raise_when_no_account=raise_when_no_account, sem=sem)
 
         self.proxy = proxy
         self.debug = debug
@@ -108,8 +110,13 @@ class API:
     # gql helpers
 
     async def _gql_items(
-        self, op: str, kv: dict, ft: dict | None = None, limit=-1, cursor_type="Bottom"
-    ):
+            self,
+            op: str,
+            kv: dict,
+            ft: dict | None = None,
+            limit=-1, cursor_type="Bottom",
+            stopping_condition: Callable = None,
+            flag: bool = None):
         queue, cur, cnt, active = op.split("/")[-1], None, 0, True
         kv, ft = {**kv}, {**GQL_FEATURES, **(ft or {})}
 
@@ -139,14 +146,20 @@ class API:
                     x
                     for x in els
                     if not (
-                        x["entryId"].startswith("cursor-")
-                        or x["entryId"].startswith("messageprompt-")
+                            x["entryId"].startswith("cursor-")
+                            or x["entryId"].startswith("messageprompt-")
                     )
                 ]
                 cur = self._get_cursor(obj, cursor_type)
 
                 rep, cnt, active = self._is_end(rep, queue, els, cur, cnt, limit)
                 if rep is None:
+                    return
+
+                # test stopping condition
+                if (stopping_condition is not None) and (stopping_condition(rep)):
+                    flag = True
+                    yield rep
                     return
 
                 yield rep
@@ -258,7 +271,7 @@ class API:
             **(kv or {}),
         }
         async with aclosing(
-            self._gql_items(op, kv, limit=limit, cursor_type="ShowMoreThreads")
+                self._gql_items(op, kv, limit=limit, cursor_type="ShowMoreThreads")
         ) as gen:
             async for x in gen:
                 yield x
@@ -349,7 +362,8 @@ class API:
 
     # favoriters
 
-    @deprecated("Likes is no longer available in X, see: https://x.com/XDevelopers/status/1800675411086409765")  # fmt: skip
+    @deprecated(
+        "Likes is no longer available in X, see: https://x.com/XDevelopers/status/1800675411086409765")  # fmt: skip
     async def favoriters_raw(self, twid: int, limit=-1, kv=None):
         op = OP_Favoriters
         kv = {"tweetId": str(twid), "count": 20, "includePromotedContent": True, **(kv or {})}
@@ -357,7 +371,8 @@ class API:
             async for x in gen:
                 yield x
 
-    @deprecated("Likes is no longer available in X, see: https://x.com/XDevelopers/status/1800675411086409765")  # fmt: skip
+    @deprecated(
+        "Likes is no longer available in X, see: https://x.com/XDevelopers/status/1800675411086409765")  # fmt: skip
     async def favoriters(self, twid: int, limit=-1, kv=None):
         async with aclosing(self.favoriters_raw(twid, limit=limit, kv=kv)) as gen:
             async for rep in gen:
@@ -366,7 +381,7 @@ class API:
 
     # user_tweets
 
-    async def user_tweets_raw(self, uid: int, limit=-1, kv=None):
+    async def user_tweets_raw(self, uid: int, limit=-1, kv=None, stopping_condition: Callable = None):
         op = OP_UserTweets
         kv = {
             "userId": str(uid),
@@ -377,19 +392,21 @@ class API:
             "withV2Timeline": True,
             **(kv or {}),
         }
-        async with aclosing(self._gql_items(op, kv, limit=limit)) as gen:
+        async with aclosing(self._gql_items(op, kv, limit=limit, stopping_condition=stopping_condition)) as gen:
             async for x in gen:
                 yield x
 
-    async def user_tweets(self, uid: int, limit=-1, kv=None):
-        async with aclosing(self.user_tweets_raw(uid, limit=limit, kv=kv)) as gen:
+    async def user_tweets(self, uid: int, limit=-1, kv=None, stopping_condition: Callable = None):
+        async with aclosing(
+                self.user_tweets_raw(uid, limit=limit, kv=kv, stopping_condition=stopping_condition)) as gen:
             async for rep in gen:
                 for x in parse_tweets(rep.json(), limit):
                     yield x
 
     # user_tweets_and_replies
 
-    async def user_tweets_and_replies_raw(self, uid: int, limit=-1, kv=None):
+    async def user_tweets_and_replies_raw(self, uid: int, limit=-1, kv=None, stopping_condition: Callable = None,
+                                          flag: bool = None):
         op = OP_UserTweetsAndReplies
         kv = {
             "userId": str(uid),
@@ -400,12 +417,19 @@ class API:
             "withV2Timeline": True,
             **(kv or {}),
         }
-        async with aclosing(self._gql_items(op, kv, limit=limit)) as gen:
+        async with aclosing(
+                self._gql_items(op, kv, limit=limit, stopping_condition=stopping_condition, flag=flag)) as gen:
             async for x in gen:
                 yield x
 
-    async def user_tweets_and_replies(self, uid: int, limit=-1, kv=None):
-        async with aclosing(self.user_tweets_and_replies_raw(uid, limit=limit, kv=kv)) as gen:
+    async def user_tweets_and_replies(self,
+                                      uid:
+                                      int, limit=-1,
+                                      kv=None,
+                                      stopping_condition: Callable = None,
+                                      flag: bool = None):
+        async with aclosing(self.user_tweets_and_replies_raw(uid, limit=limit, kv=kv,
+                                                             stopping_condition=stopping_condition, flag=flag)) as gen:
             async for rep in gen:
                 for x in parse_tweets(rep.json(), limit):
                     yield x
@@ -460,7 +484,8 @@ class API:
 
     # likes
 
-    @deprecated("Likes is no longer available in X, see: https://x.com/XDevelopers/status/1800675411086409765")  # fmt: skip
+    @deprecated(
+        "Likes is no longer available in X, see: https://x.com/XDevelopers/status/1800675411086409765")  # fmt: skip
     async def liked_tweets_raw(self, uid: int, limit=-1, kv=None):
         op = OP_Likes
         kv = {
@@ -475,7 +500,8 @@ class API:
             async for x in gen:
                 yield x
 
-    @deprecated("Likes is no longer available in X, see: https://x.com/XDevelopers/status/1800675411086409765")  # fmt: skip
+    @deprecated(
+        "Likes is no longer available in X, see: https://x.com/XDevelopers/status/1800675411086409765")  # fmt: skip
     async def liked_tweets(self, uid: int, limit=-1, kv=None):
         async with aclosing(self.liked_tweets_raw(uid, limit=limit, kv=kv)) as gen:
             async for rep in gen:
