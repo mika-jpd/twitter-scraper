@@ -1,0 +1,50 @@
+services:
+  launcher:
+    container_name: launcher
+    build:
+      context: ./api
+    ports:
+      - 8000:8000
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - scraper-network
+
+  redis:
+    container_name: redis
+    image: "redis:latest"
+    networks:
+      - scraper-network
+
+  worker:
+    command: ["python", "-u", "redis_worker.py"]  # Add -u flag
+    container_name: worker
+    build:
+      context: ./scraper
+      platforms:
+        - linux/amd64
+    depends_on:
+      - redis
+      - launcher
+    restart: unless-stopped
+    networks:
+      - scraper-network
+    volumes:
+      - ./database/accounts.db:/data/db/accounts.db
+
+  sqlite3-db:
+    container_name: sqlite3-db
+    build:
+      context: ./database
+    ports:
+      - 8080:8080
+    restart: unless-stopped
+    networks:
+      - scraper-network
+    volumes:
+      - ./database/accounts.db:/data/db/accounts.db
+
+networks:
+  scraper-network:
+    driver: bridge
