@@ -1,1 +1,0 @@
-from scraper.my_utils.upload_to_s3.upload_to_s3 import upload_to_s3

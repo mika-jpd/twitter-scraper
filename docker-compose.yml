@@ -1,8 +1,11 @@
 services:
-  launcher:
-    container_name: launcher
+  api:
+    container_name: api
     build:
-      context: ./api
+      context: .
+      dockerfile: api.dockerfile
+      platforms:
+        - linux/amd64
     ports:
       - 8000:8000
     depends_on:
@@ -10,6 +13,9 @@ services:
     restart: unless-stopped
     networks:
       - scraper-network
+    volumes:
+      - ./db:/db
+      - ./output:/output
 
   redis:
     container_name: redis
@@ -18,32 +24,54 @@ services:
       - scraper-network
 
   worker:
-    command: ["python", "-u", "redis_worker.py"]  # Add -u flag
+    # command: ["python", "-m", "app.worker.worker"]  - already defined in worker.dockerfile
+    environment:
+      - OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
     container_name: worker
     build:
-      context: ./scraper
+      context: .
+      dockerfile: worker.dockerfile
       platforms:
         - linux/amd64
     depends_on:
       - redis
-      - launcher
+      - api
     restart: unless-stopped
     networks:
       - scraper-network
     volumes:
-      - ./database/accounts.db:/data/db/accounts.db
+      - ./db:/db
+      - ./output:/output
 
   sqlite3-db:
     container_name: sqlite3-db
     build:
-      context: ./database
+      context: .
+      dockerfile: db.dockerfile
+      platforms:
+        - linux/amd64
     ports:
       - 8080:8080
     restart: unless-stopped
     networks:
       - scraper-network
     volumes:
-      - ./database/accounts.db:/data/db/accounts.db
+      - ./db:/db
+      - ./output:/output
+
+  scheduler:
+    container_name: scheduler
+    build:
+      context: .
+      dockerfile: scheduler.dockerfile
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - scraper-network
+    volumes:
+      - ./db:/db
+      - ./output:/output
 
 networks:
   scraper-network:
