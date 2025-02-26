@@ -1,8 +1,15 @@
 db/
-output/
 temp/
 dump.rdb
 app/.env
+
+# Ignore everything in output directories
+/output/data/*
+/output/logs/*
+
+# But keep the .gitkeep files
+!/output/data/.gitkeep
+!/output/logs/.gitkeep
 
 # PyCharm cache files
 __pycache__/
