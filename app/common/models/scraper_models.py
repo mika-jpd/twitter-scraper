@@ -3,6 +3,7 @@ import datetime
 from pydantic import BaseModel, model_validator
 from enum import Enum
 
+
 class CustomQuery(BaseModel):
     query: str
     filename: str
@@ -49,7 +50,7 @@ class ConfigModel(BaseModel):
     use_case: Optional[int] = None
     limit: Optional[Limits] = Limits()
     dates: Optional[Dates] = None
-    scrape_method: Literal["timeline", "search"] = "timeline"
+    scrape_method: Literal["timeline", "search", "explore", "search_explore"] = "timeline"
     _log_level: str = "info"
 
     @model_validator(mode='after')
@@ -67,7 +68,7 @@ class ConfigModel(BaseModel):
     @model_validator(mode="after")
     def validate_dates(self) -> 'ConfigModel':
         if self.dates:
-            if not (datetime.datetime.strptime(self.dates.start_date, '%Y-%m-%d') < datetime.datetime.strptime(
+            if not (datetime.datetime.strptime(self.dates.start_date, '%Y-%m-%d') <= datetime.datetime.strptime(
                     self.dates.end_date, '%Y-%m-%d')):
                 raise ValueError("Start date < end date.")
         return self

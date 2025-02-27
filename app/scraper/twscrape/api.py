@@ -7,7 +7,7 @@ from typing_extensions import deprecated
 
 from .accounts_pool import AccountsPool
 from .logger import set_log_level
-from .models import Tweet, User, parse_tweet, parse_tweets, parse_user, parse_users
+from .models import Tweet, User, parse_tweet, parse_tweets, parse_user, parse_users, parse_trends
 from .queue_client import QueueClient
 from .utils import encode_params, find_obj, get_by_path
 
@@ -28,6 +28,7 @@ OP_BlueVerifiedFollowers = "cpPRJUmSz2Fiu1PpIYmEsw/BlueVerifiedFollowers"
 OP_UserCreatorSubscriptions = "qHaReNBi0rkhjAe14jrs6A/UserCreatorSubscriptions"
 OP_UserMedia = "dexO_2tohK86JDudXXG3Yw/UserMedia"
 OP_Bookmarks = "QUjXply7fA7fk05FRyajEg/Bookmarks"
+OP_Explore = "5u36Lskx1dfACjC_WHmH3Q/GenericTimelineById"
 
 GQL_URL = "https://x.com/i/api/graphql"
 GQL_FEATURES = {  # search values here (view source) https://x.com/
@@ -370,6 +371,49 @@ class API:
         async with aclosing(self.retweeters_raw(twid, limit=limit, kv=kv)) as gen:
             async for rep in gen:
                 for x in parse_users(rep.json(), limit):
+                    yield x
+
+    async def list_explore_raw(self, timeline_id: str, kv: dict = None):
+        """
+        :param timeline_id: The ID of the trending timeline you wish to scrape
+                    * 'trending': VGltZWxpbmU6DAC2CwABAAAACHRyZW5kaW5nAAA
+                    * 'news': VGltZWxpbmU6DAC2CwABAAAABG5ld3MAAA
+                    * 'sports': VGltZWxpbmU6DAC2CwABAAAABnNwb3J0cwAA
+                    * 'entertainment': VGltZWxpbmU6DAC2CwABAAAADWVudGVydGFpbm1lbnQAAA
+        :type timeline_id: str
+        """
+        op = OP_Explore
+        kv = {
+            "timelineId": timeline_id,
+            "count": 20,
+            "withQuickPromoteEligibilityTweetFields": True,
+            **(kv or {}),
+        }
+        ft = {
+            "responsive_web_grok_analysis_button_from_backend": False,
+            "responsive_web_grok_image_annotation_enabled": False,
+            "responsive_web_jetfuel_frame": False,
+            "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
+            "responsive_web_grok_share_attachment_enabled": False,
+            "responsive_web_grok_analyze_post_followups_enabled": False,
+            "profile_label_improvements_pcf_label_in_post_enabled": False,
+            "premium_content_api_read_enabled": False
+        }
+        return await self._gql_item(op, kv, ft=ft)
+
+    async def list_explore(self, timeline_id: str = None, limit=-1, kv=None):
+        rep = await self.list_explore_raw(timeline_id, kv=kv)
+        for x in parse_trends(rep, limit=limit):
+            yield x
+
+    async def search_trend(self, q: str, limit: int = -1, kv=None):
+        kv = {
+            "querySource": "trend_click",
+            **(kv or {}),
+        }
+        async with aclosing(self.search_raw(q, limit=limit, kv=kv)) as gen:
+            async for rep in gen:
+                for x in parse_tweets(rep.json(), limit):
                     yield x
 
     # favoriters

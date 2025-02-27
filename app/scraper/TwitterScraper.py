@@ -25,8 +25,8 @@ import random
 AsyncCallable = Callable[[Any, Any], Awaitable[Any]]
 logger = get_logger()
 
-def change_to_new_format(data: list[dict], seed_info: dict, force_collection: bool = False) -> list[dict]:
 
+def change_to_new_format(data: list[dict], seed_info: dict, force_collection: bool = False) -> list[dict]:
     phh_id = seed_info["ID"]
     seed_id = seed_info["SeedID"]
     collection = seed_info["Collection"]
@@ -133,8 +133,12 @@ class TwitterScraper:
                    bool_upload_to_s3: bool = True,
                    bool_change_to_new_format: bool = True
                    ):
-        logger.info(
-            f"Saving {len([d for d in data])} from {seed_info['Handle']} to {path} with new_format set to {bool_change_to_new_format}, s3 {bool_upload_to_s3} and update_phh_history {update_phh_history}.")
+        logger.info(f"Saving {len([d for d in data])} "
+                    f"from seed {seed_info['Handle'] if seed_info else None} "
+                    f"to {path} "
+                    f"with new_format set to {bool_change_to_new_format}, "
+                    f"s3 {bool_upload_to_s3} "
+                    f"and update_phh_history {update_phh_history}.")
         data = [t.dict() if not isinstance(t, dict) else t for t in data]
 
         if bool_change_to_new_format:
@@ -207,7 +211,8 @@ class TwitterScraper:
         else:
             data, flag = await self.user_tweets_and_replies_twscrape(query, stopping_condition)
         # check if flag went off
-        if stopping_condition and len(data) > 0:  # triggers if you scraped all the tweets in a person's timeline (1. there are tweets) & you haven't gone far back enough (2. those tweets didn't trigger stopping condition)
+        if stopping_condition and len(
+                data) > 0:  # triggers if you scraped all the tweets in a person's timeline (1. there are tweets) & you haven't gone far back enough (2. those tweets didn't trigger stopping condition)
             if not flag.get_flag():  # then you might have to do some work
                 # figure out the earliest tweet that you have
                 user_tweets: list[Tweet] = get_user_tweets_only(data)
@@ -265,6 +270,50 @@ class TwitterScraper:
                                bool_change_to_new_format=bool_change_to_new_format)
         return data
 
+    async def explore_twscrape_and_save(self,
+                                        query: str,
+                                        path: str,
+                                        bool_upload_to_s3: bool = True,
+                                        sem: asyncio.Semaphore = None) -> list[dict] | list:
+        if sem:
+            async with sem:
+                data = await self.explore_twscrape(query=query)
+        else:
+            data = await self.explore_twscrape(query=query)
+        data = await self.save(data=data,
+                               path=path,
+                               seed_info={},
+                               start_date=datetime.datetime.now().strftime('%Y-%m-%d'),
+                               end_date=datetime.datetime.now().strftime('%Y-%m-%d'),
+                               update_phh_history=False,  # no seed for which to update phh history
+                               bool_change_to_new_format=False,  # no need to change format
+                               force_collection=False,  # no force collection
+                               bool_upload_to_s3=bool_upload_to_s3)
+        return data
+
+    async def search_explore_twscrape_and_save(self,
+                                               query: str,
+                                               path: str,
+                                               product: str = "Top",
+                                               bool_upload_to_s3: bool = True,
+                                               limit: int = -1,
+                                               sem: asyncio.Semaphore = None) -> list[dict] | list:
+        if sem:
+            async with sem:
+                data = await self.search_explore_twscrape(query=query, limit=limit, product=product)
+        else:
+            data = await self.search_explore_twscrape(query=query, limit=limit, product=product)
+        data = await self.save(data=data,
+                               path=path,
+                               seed_info={},
+                               start_date=datetime.datetime.now().strftime('%Y-%m-%d'),
+                               end_date=datetime.datetime.now().strftime('%Y-%m-%d'),
+                               update_phh_history=False,  # no seed for which to update phh history
+                               bool_change_to_new_format=False,  # no need to change format
+                               force_collection=False,  # no force collection
+                               bool_upload_to_s3=bool_upload_to_s3)
+        return data
+
     async def user_by_login_twscrape(self, username: str):
         return await self.api.user_by_login(username)
 
@@ -303,6 +352,26 @@ class TwitterScraper:
         """
         logger.info(f'searching query: {query}')
         data = await gather(self.api.search(query, limit))
+        return data
+
+    async def explore_twscrape(self, query: str) -> list:
+        logger.info('getting twitter explore trending')
+        timeline_to_id: dict = {
+            "trending": "VGltZWxpbmU6DAC2CwABAAAACHRyZW5kaW5nAAA=",
+            'news': "VGltZWxpbmU6DAC2CwABAAAABG5ld3MAAA==",
+            'sports': "VGltZWxpbmU6DAC2CwABAAAABnNwb3J0cwAA",
+            'entertainment': "VGltZWxpbmU6DAC2CwABAAAADWVudGVydGFpbm1lbnQAAA=="
+        }
+        timeline_id = timeline_to_id[query] if query in timeline_to_id else timeline_to_id["trending"]
+        data = await gather(self.api.list_explore(timeline_id=timeline_id))
+        return data
+
+    async def search_explore_twscrape(self, query, limit: int = -1, product: str = "Top") -> list:
+        logger.info(f"searching twitter trending tweets for timeline {query}")
+        kv: dict = {
+            "product": product
+        }
+        data = await gather(self.api.search_trend(q=query, limit=limit, kv=kv))
         return data
 
     async def mark_active_accounts_not_in_use(self):
@@ -483,6 +552,12 @@ class TwitterScraper:
     async def user_tweets_scrape(self, queries: list[dict]):
         return await self.run_scraper(queries=queries, func=self.user_tweets_and_replies_twscrape_and_save)
 
+    async def explore_scrape(self, queries: list[dict]):
+        return await self.run_scraper(queries=queries, func=self.explore_twscrape_and_save)
+
+    async def search_explore_scrape(self, queries: list[dict]):
+        return await self.run_scraper(queries=queries, func=self.search_explore_twscrape_and_save)
+
     async def run_scraper(self,
                           queries: list[dict],
                           func: Callable
@@ -492,7 +567,7 @@ class TwitterScraper:
         meta_data: dict = {
             "start_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
-        query_meta_data: dict = {}
+        scraping_results: None = None
         if len(queries) > 0:
             # log into all accounts before starting
             await self.login_to_all_accounts()
@@ -516,6 +591,7 @@ class TwitterScraper:
             )
 
         meta_data["post_scraping_accounts"] = {acc.username: acc.active for acc in accounts_after}
-
+        if func == self.explore_twscrape_and_save:
+            return {"meta_data": meta_data, "scraping_results": scraping_results[0]}
         # output scraping metadata
         return meta_data

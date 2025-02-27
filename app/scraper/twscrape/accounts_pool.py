@@ -60,11 +60,12 @@ class AccountsPool:
 
         # added by mika_jpd
         self.endpoint_to_spread = {
-            'SearchTimeline': 15,
+            'SearchTimeline': 18,
             'UserByScreenName': 10,
             'UserTweets': 25,
             'UserTweetsAndReplies': 15,
-            "TweetDetail": 9
+            "TweetDetail": 9,
+            "GenericTimelineById": 1
         }
 
     async def load_from_file(self, filepath: str, line_format: str):

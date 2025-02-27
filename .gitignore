@@ -1,5 +1,9 @@
 db/
 temp/
+app/scraper/logistical_utils
+app/scraper/scripts
+app/scraper/hti/twitter_api_client
+app/scraper/hti/twitterActions_api.py
 dump.rdb
 app/.env
 

@@ -42,3 +42,23 @@ class SearchQuery(BaseModel):
 
     def to_dict(self) -> dict:
         return self.model_dump()
+
+
+class ExploreQuery(BaseModel):
+    query: str
+    path: str
+    bool_upload_to_s3: bool = True
+
+    def to_dict(self) -> dict:
+        return self.model_dump()
+
+
+class SearchExploreQuery(BaseModel):
+    query: str
+    path: str
+    product: str = "Top"
+    bool_upload_to_s3: bool = True
+    limit: int = -1
+
+    def to_dict(self) -> dict:
+        return self.model_dump()

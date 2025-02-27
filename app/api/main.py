@@ -43,7 +43,7 @@ async def lifespan():
 
     now = datetime.datetime.utcnow()
 
-    # daily
+    # daily seed scraping
     scheduled_time_daily = datetime.datetime(year=now.year, month=now.month, day=now.day + 1, hour=11, minute=0,
                                              second=0, tzinfo=datetime.timezone.utc)
     interval_daily = 86400
@@ -61,8 +61,27 @@ async def lifespan():
         result_ttl=604800  # keep for 7 days
     )
 
-    # tridaily
-    scheduled_time_tridaily = datetime.datetime(year=now.year, month=now.month, day=now.day, hour=17, minute=40,
+    # daily trending
+    trending_scheduled_time_daily = datetime.datetime(year=now.year, month=now.month, day=now.day + 1, hour=1,
+                                                      minute=30, second=0, tzinfo=datetime.timezone.utc)
+    interval_daily = 86400
+    logger.info(
+        f"Scheduling daily scrape of trends and their associated tweets job starting {trending_scheduled_time_daily} (UTC) "
+        f"repeating every {interval_daily} seconds"
+    )
+
+    scheduler.schedule(
+        scheduled_time=trending_scheduled_time_daily,
+        interval=interval_daily,
+        func="app.worker.tasks.enqueue_front_with_unique_id",
+        args=["app.worker.tasks.collect_trends_and_tweets", "scraper_queue"],
+        kwargs={"query": "trending"},
+        at_front=True,
+        result_ttl=604800  # keep for 7 days
+    )
+
+    # tridaily seed scraping
+    scheduled_time_tridaily = datetime.datetime(year=now.year, month=now.month, day=now.day, hour=18, minute=00,
                                                 second=0, tzinfo=datetime.timezone.utc)
     interval_tridaily = 3 * 86400  # 3*24 hours i.e. once every three days
     logger.info(

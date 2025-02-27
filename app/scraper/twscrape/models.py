@@ -17,6 +17,7 @@ from .utils import find_item, get_or, int_or, to_old_rep, utc
 
 logger = get_logger()
 
+
 @dataclass
 class JSONTrait:
     def dict(self):
@@ -169,6 +170,7 @@ class User(JSONTrait):
                 user_dict['descriptionLinks'] = descriptionLinks
         return user_dict
 
+
 @dataclass
 class Tweet(JSONTrait):
     id: int
@@ -287,29 +289,37 @@ class Tweet(JSONTrait):
                     att = self.quotedTweet
                 elif k == 'media':
                     att = self.media
-                if att != None: tweet_dict[k] = att.dict()
-                else: tweet_dict[k] = {}
+                if att != None:
+                    tweet_dict[k] = att.dict()
+                else:
+                    tweet_dict[k] = {}
             elif k == 'hashtags' or k == 'cashtags':
                 if k == 'hashtags':
                     att = self.hashtags
                 elif k == 'cashtags':
                     att = self.cashtags
-                if att != []: tweet_dict[k] = [h for h in att]
-                else: tweet_dict[k] = []
+                if att != []:
+                    tweet_dict[k] = [h for h in att]
+                else:
+                    tweet_dict[k] = []
             elif k == 'mentionedUsers' or k == 'links':
                 if k == 'mentionedUsers':
                     att = self.mentionedUsers
                 elif k == 'links':
                     att = self.links
-                if att != []: tweet_dict[k] = [h.dict() for h in att]
-                else: tweet_dict[k] = []
-            elif k == 'inReplyToUser' or k == 'place': # if things are already dicts
+                if att != []:
+                    tweet_dict[k] = [h.dict() for h in att]
+                else:
+                    tweet_dict[k] = []
+            elif k == 'inReplyToUser' or k == 'place':  # if things are already dicts
                 if k == 'inReplyToUser':
                     att = self.inReplyToUser
                 elif k == 'place':
                     att = self.place
-                if att is not None: tweet_dict[k] = att.dict()
-                else: tweet_dict[k] = {}
+                if att is not None:
+                    tweet_dict[k] = att.dict()
+                else:
+                    tweet_dict[k] = {}
         tweet_dict['date_scrape'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return tweet_dict
 
@@ -345,6 +355,7 @@ class MediaVideo(JSONTrait):
         mediaVideo_dict = {k: str(v) for k, v in asdict(self).items()}
         mediaVideo_dict['variants'] = [v.dict() for v in self.variants]
         return mediaVideo_dict
+
 
 @dataclass
 class MediaAnimated(JSONTrait):
@@ -418,6 +429,7 @@ class Media(JSONTrait):
             media_dict[att_name] = sub_media_dict
         return media_dict
 
+
 @dataclass
 class Card(JSONTrait):
     pass
@@ -457,7 +469,6 @@ class PollCard(Card):
         return poll_card_dict
 
 
-
 @dataclass
 class BroadcastCard(Card):
     title: str
@@ -470,6 +481,66 @@ class BroadcastCard(Card):
 class AudiospaceCard(Card):
     url: str
     _type: str = "audiospace"
+
+
+@dataclass
+class RequestParam(JSONTrait):
+    key: str
+    value: str
+
+
+@dataclass
+class UrtEndpointOption(JSONTrait):
+    requestParams: list[RequestParam]
+
+
+@dataclass
+class TrendUrl(JSONTrait):
+    url: str
+    urlType: str
+    urlEndpointOptions: list[RequestParam]
+
+
+@dataclass
+class TrendMetadata(JSONTrait):
+    domain_context: str
+    meta_description: str
+    url: TrendUrl
+
+
+@dataclass
+class GroupedTrend(JSONTrait):
+    name: str
+    url: TrendUrl
+
+
+@dataclass
+class TimelineTrend(JSONTrait):
+    id: Optional[str]
+    rank: Optional[str | int]
+    name: str
+    trend_url: TrendUrl
+    trend_metadata: TrendMetadata
+    grouped_trends: Optional[list[GroupedTrend]]
+    date: Optional[datetime]
+    _type: str = "timelinetrend"
+
+    @staticmethod
+    def parse(obj: dict, res=None):
+        return TimelineTrend(
+            id=f"trend-{obj['name']}",
+            name=obj["name"],
+            rank=int(obj["rank"]) if "rank" in obj else None,
+            trend_url=obj["trend_url"],
+            trend_metadata=obj["trend_metadata"],
+            grouped_trends=obj["grouped_trends"] if "grouped_trends" in obj else None,
+            date=datetime.now()
+        )
+
+    def dict(self) -> dict:
+        d = asdict(self)
+        d["date"] = self.date.strftime("%Y-%m-%d %H:%M:%S")
+        return d
 
 
 def _parse_card_get_bool(values: list[dict], key: str):
@@ -579,8 +650,8 @@ def _parse_card(obj: dict, url: str):
 
         options = []
         for x in range(20):
-            label = _parse_card_get_str(val, f"choice{x+1}_label")
-            votes = _parse_card_get_str(val, f"choice{x+1}_count")
+            label = _parse_card_get_str(val, f"choice{x + 1}_label")
+            votes = _parse_card_get_str(val, f"choice{x + 1}_count")
             if label is None or votes is None:
                 break
 
@@ -704,6 +775,8 @@ def _parse_items(rep: httpx.Response, kind: str, limit: int = -1):
         Cls, key = User, "users"
     elif kind == "tweet":
         Cls, key = Tweet, "tweets"
+    elif kind == "trends":
+        Cls, key = TimelineTrend, "trends"
     else:
         raise ValueError(f"Invalid kind: {kind}")
 
@@ -760,4 +833,19 @@ def parse_user(rep: httpx.Response) -> User | None:
         return None
     except Exception as e:
         logger.error(f"Failed to parse user - {type(e)}:\n{traceback.format_exc()}")
+        return None
+
+
+def parse_trends(rep: httpx.Response, limit: int = -1) -> Generator[TimelineTrend, None, None]:
+    return _parse_items(rep, kind="trends", limit=limit)
+
+
+def parse_trend(rep: httpx.Response) -> TimelineTrend | None:
+    try:
+        docs = list(parse_trends(rep))
+        if len(docs) == 1:
+            return docs[0]
+        return None
+    except Exception as e:
+        logger.error(f"Failed to parse trend - {type(e)}:\n{traceback.format_exc()}")
         return None

@@ -1,30 +1,28 @@
 # local
-import json
-import os.path
-import time
-
-import names
-
 from app.common.logger import get_logger, setup_logging
 from app.scraper.hti.twitterActions_manual import TwitterActions
 from app.scraper.hti.humanTwitterInteraction import process_cookies_out
 from app.scraper.hti.scraping_utils.typer import Typer
 from app.scraper.hti.scraping_utils.email_utils import get_gmail_verification_code, get_duck_duck_go_email
-from app.scraper.my_utils.textverified_api import get_bearer_token, create_verification, get_verification_details, \
-    get_correct_recent_sms_verification_code
+from app.scraper.my_utils.textverified_api import get_bearer_token, create_verification, get_verification_details, get_correct_recent_sms_verification_code
 from app.scraper.twscrape import Account
 from app.scraper.twscrape.api import API
 
-# modules
+# zendriver
 from asyncio.exceptions import TimeoutError
 from zendriver import Tab, Browser, Element
 from zendriver.core.connection import ProtocolException
-import asyncio
 import zendriver
+
+# libs
+import asyncio
 from httpx import AsyncClient
 import random
 from dotenv import load_dotenv
-import requests
+import json
+import os.path
+import time
+import names
 
 # typing
 from typing import Callable, Optional

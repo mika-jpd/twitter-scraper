@@ -7,7 +7,7 @@ from app.scraper.my_utils.seed_manipulation.seeds import sort_seeds
 from app.scraper.twscrape.models import Tweet, parse_tweets
 from app.common.logger import setup_logging, get_logger, logger
 from app.scraper.my_utils.dates import bin_and_tuple_date_range
-from app.scraper.my_utils.queryModels import SearchQuery, TimelineQuery
+from app.scraper.my_utils.queryModels import SearchQuery, TimelineQuery, ExploreQuery, SearchExploreQuery
 from app.common.models.scraper_models import ConfigModel
 from app.common.utils import get_project_root
 from app.common.queues import scraper_queue, account_queue
@@ -140,7 +140,7 @@ def generate_queries(seed_query: str,
 
 
 @logger.catch(reraise=True)
-def scrape_twitter_(config: ConfigModel):
+def scrape_twitter_(config: ConfigModel) -> dict:
     logger = get_logger()
     logger.info("Starting twitter scrape function.")
     # scraping method
@@ -239,8 +239,7 @@ def scrape_twitter_(config: ConfigModel):
             date_ranges=date_ranges
         )
     else:
-
-        queries: list[SearchQuery | TimelineQuery] = []
+        queries: list[SearchQuery | TimelineQuery | ExploreQuery | SearchExploreQuery] = []
         for q in config.custom_queries:
             if scrape_method == "search":
                 queries.append(
@@ -254,6 +253,22 @@ def scrape_twitter_(config: ConfigModel):
                         bool_upload_to_s3=q.bool_upload_to_s3,
                         bool_change_to_new_format=q.bool_change_to_new_format,
                         force_collection=q.force_collection
+                    )
+                )
+            elif scrape_method == "explore":
+                queries.append(
+                    ExploreQuery(
+                        query=q.query,
+                        path=os.path.join(path_output_data, q.filename),
+                        bool_upload_to_s3=q.bool_upload_to_s3
+                    )
+                )
+            elif scrape_method == 'search_explore':
+                queries.append(
+                    SearchExploreQuery(
+                        query=q.query,
+                        path=os.path.join(path_output_data, q.filename),
+                        bool_upload_to_s3=q.bool_upload_to_s3
                     )
                 )
             else:  # scrape_method is timeline
@@ -289,9 +304,24 @@ def scrape_twitter_(config: ConfigModel):
                 queries=queries
             )
         )
+    elif scrape_method == "explore":
+        scrape_meta_data: dict = asyncio.run(
+            scraper.explore_scrape(
+                queries=queries
+            )
+        )
+    elif scrape_method == "search_explore":
+        scrape_meta_data: dict = asyncio.run(
+            scraper.search_explore_scrape(
+                queries=queries
+            )
+        )
     else:
         raise ValueError(f"Scrape method must either be timeline or search !")
-
+    results: Optional[list[dict]] = None
+    if scrape_method == "explore":
+        results = scrape_meta_data["scraping_results"]
+        scrape_meta_data: dict = scrape_meta_data["meta_data"]
     # show meta-data
     total_tweets_collected: int = scrape_meta_data["total_tweets_collected"]
     total_scraped_queries: int = scrape_meta_data["total_num_queries"]
@@ -305,7 +335,180 @@ def scrape_twitter_(config: ConfigModel):
     logger.info(f"Post scraping accounts:")
     msg: str = "".join(f"\n\t- {username}: active {active}" for username, active in post_scraping_accounts.items())
     logger.info(msg)
+    if scrape_method == "explore":
+        return {"scrape_meta_data": scrape_meta_data, "scraping_results": results}
     return scrape_meta_data
+
+
+def collect_trends(scrape_meta_data: dict) -> dict:
+    job_id: str = scrape_meta_data["job_id"]
+    query: str = scrape_meta_data["query"]  # change what the query is in API
+    now: datetime.datetime = datetime.datetime.now().replace(tzinfo=tz.gettz('US/Eastern'))
+
+    # setup logging
+    setup_logging(job_id=job_id)
+    logger = get_logger()
+    logger.info(f"Getting Twitter trending for {now.strftime('%Y-%m-%d')} (US/Eastern)")
+
+    try:
+        config: dict = {
+            "use_case": 1,
+            "s3paths": {
+                "bucket": "meo-raw-data",
+                "folder": "keywords-based-data/twitter/explore_page",
+                "meta_folder": "twitter/meta"
+            },
+            "dates": {"start_date": now.strftime('%Y-%m-%d'), "end_date": now.strftime('%Y-%m-%d')},
+            "custom_queries_dirname": f"{query}_keywords_{now.strftime('%Y-%m-%d_%H_%M_%S')}",
+            # .strftime("%Y-%m-%d %H:%M:%S")
+            "scrape_method": f"explore",
+            "custom_queries": [
+                {"query": f"{query}",
+                 "filename": f"explore_{query}_keywords_{now.strftime('%Y-%m-%d_%H_%M_%S')}.jsonl",
+                 "start_date": now.strftime('%Y-%m-%d'),
+                 }
+            ]
+        }
+
+        config: ConfigModel = ConfigModel(**config)
+
+        # .env
+        load_dotenv()
+
+        # AWS access setup
+        AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+        os.environ["AWS_ACCESS_KEY_ID"] = AWS_ACCESS_KEY_ID
+        AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+        os.environ["AWS_SECRET_ACCESS_KEY"] = AWS_SECRET_ACCESS_KEY
+        AWS_REGION = os.getenv("AWS_REGION")
+        os.environ["AWS_REGION"] = AWS_REGION
+
+        # make bucket environmental
+        os.environ["S3BUCKET"] = config.s3paths.bucket  # config["s3paths"]["bucket"]
+        os.environ["S3FOLDER"] = config.s3paths.folder  # config["s3paths"]["folder"]
+        os.environ["S3META_FOLDER"] = config.s3paths.meta_folder  # config["s3paths"]["meta-folder"]
+
+        return scrape_twitter_(config=config)
+
+    except Exception as e:
+        logger.error(f'Scraping job failed with exception {e}')
+        logger.error(traceback.format_exc())
+        return {"status": "failed", "error": str(e), "job_id": job_id}
+
+
+def collect_trending_tweets(scrape_meta_data: dict) -> dict:
+    def make_keyword_file_compatible(keyword: str) -> str:
+        keyword = keyword.replace(" ", "_")
+        keyword = keyword.lower()
+        keyword = keyword.replace("#", "")
+        keyword = keyword.replace("-", "_")
+        return keyword
+
+    job_id: str = scrape_meta_data["job_id"]
+    query: str = scrape_meta_data["query"]
+    keywords: list[str] | str = scrape_meta_data["keywords"]
+    now: datetime.datetime = datetime.datetime.now().replace(tzinfo=tz.gettz('US/Eastern'))
+
+    # setup logging
+    setup_logging(job_id=job_id)
+    logger = get_logger()
+    logger.info(f"Getting Twitter {query} and their tweets for {now.strftime('%Y-%m-%d')} (US/Eastern)")
+
+    try:
+        keywords = keywords if isinstance(keywords, list) else [keywords]
+        config: dict = {
+            "use_case": 1,
+            "s3paths": {
+                "bucket": "meo-raw-data",
+                "folder": "keywords-based-data/twitter/keywords",
+                "meta_folder": "twitter/meta"
+            },
+            "dates": {"start_date": now.strftime('%Y-%m-%d'), "end_date": now.strftime('%Y-%m-%d')},
+            "custom_queries_dirname": f"{query}_tweets_{now.strftime('%Y-%m-%d_%H_%M_%S')}",
+            "scrape_method": f"search_explore",
+            "custom_queries": [
+                {"query": f"{k}",
+                 "filename": f"{make_keyword_file_compatible(k)}_{query}_keywords_{now.strftime('%Y-%m-%d_%H_%M_%S')}.jsonl"
+                 } for k in keywords
+            ]
+        }
+
+        config: ConfigModel = ConfigModel(**config)
+
+        # .env
+        load_dotenv()
+
+        # AWS access setup
+        AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+        os.environ["AWS_ACCESS_KEY_ID"] = AWS_ACCESS_KEY_ID
+        AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+        os.environ["AWS_SECRET_ACCESS_KEY"] = AWS_SECRET_ACCESS_KEY
+        AWS_REGION = os.getenv("AWS_REGION")
+        os.environ["AWS_REGION"] = AWS_REGION
+
+        # make bucket environmental
+        os.environ["S3BUCKET"] = config.s3paths.bucket  # config["s3paths"]["bucket"]
+        os.environ["S3FOLDER"] = config.s3paths.folder  # config["s3paths"]["folder"]
+        os.environ["S3META_FOLDER"] = config.s3paths.meta_folder  # config["s3paths"]["meta-folder"]
+
+        return scrape_twitter_(config=config)
+
+    except Exception as e:
+        logger.error(f'Scraping job failed with exception {e}')
+        logger.error(traceback.format_exc())
+        return {"status": "failed", "error": str(e), "job_id": job_id}
+
+
+def collect_trends_and_tweets(scrape_meta_data: dict) -> dict:
+    job_id: str = scrape_meta_data["job_id"]
+    query: str = scrape_meta_data["query"]  # change what the query is in API
+    now: datetime.datetime = datetime.datetime.now().replace(tzinfo=tz.gettz('US/Eastern'))
+
+    # setup logging
+    setup_logging(job_id=job_id)
+    logger = get_logger()
+    logger.info(f"Getting Twitter explore page {query} for {now.strftime('%Y-%m-%d')} (US/Eastern) with job_id {job_id}")
+
+    try:
+        # scrape trends
+        trends_scrape_dict: dict = collect_trends(
+            {"job_id": job_id,
+             "query": query}
+        )  # {"scrape_meta_data": scrape_meta_data, "scraping_results": results}
+
+        # check failed -  scraping what's trending
+        if "status" in trends_scrape_dict and trends_scrape_dict["status"] == "failed":
+            raise Exception(f"Exception when scraping {query} for job {job_id} and query {query}"
+                            f"\n\t - status: {trends_scrape_dict['status']}"
+                            f"\n\t - error: {trends_scrape_dict['error']}")
+
+        trends_meta_data: dict = trends_scrape_dict["scrape_meta_data"]
+        trends_scraping_results: list = trends_scrape_dict["scraping_results"]  # list of TimelineTrends
+        trends_keywords: list[str] = [t["name"] for t in trends_scraping_results]  # extract the names of scraped trends
+
+        # scrape tweets in trend
+        trends_tweets_scrape: dict = collect_trending_tweets(
+            {"job_id": job_id, "query": query,
+             "keywords": trends_keywords}
+        )  # just meta_data dict
+
+        # check failed - tweets in trending
+        if "status" in trends_tweets_scrape:
+            raise Exception(f"Exception when scraping for {query} tweets for job {job_id} and query {query}"
+                            f"\n\t - status: {trends_tweets_scrape['status']}"
+                            f"\n\t - error: {trends_tweets_scrape['error']}")
+        return {
+            "collect_trends": {
+                "trends_meta_data": trends_meta_data,
+                "trends_scraping_results": trends_scraping_results
+            },
+            "collect_trending_tweets": trends_tweets_scrape
+        }
+
+    except Exception as e:
+        logger.error(f'Scraping job failed with exception {e}')
+        logger.error(traceback.format_exc())
+        return {"status": "failed", "error": str(e), "job_id": job_id}
 
 
 def run_scraper_daily(scrape_meta_data: dict):
@@ -478,16 +681,16 @@ def enqueue_front_with_unique_id(scraping_func: str, queue: str, **kwargs):
         logger.info(f"Job {scraping_func} enqueued at front successfully with job_metadata {job_metadata}")
         return {"success": True,
                 "message": f"Job enqueued to front for \n\t* function name {scraping_func},"
-                                            f"\n\t*queue {queue}, "
-                                            f"\n\t*kwargs {kwargs_str}",
+                           f"\n\t*queue {queue}, "
+                           f"\n\t*kwargs {kwargs_str}",
                 "job_id": job_id
                 }
     except Exception as e:
         logger.error(f"Failed to enqueue job: {str(e)}")
         return {"success": False,
                 "message": f"Failed to enqueue job at front for \n\t* function name {scraping_func},"
-                                            f"\n\t*queue {queue}, "
-                                            f"\n\t*kwargs {kwargs_str}",
+                           f"\n\t*queue {queue}, "
+                           f"\n\t*kwargs {kwargs_str}",
                 "error": str(e)
                 }
 
@@ -497,11 +700,21 @@ if __name__ == "__main__":
         "dates": {"start_date": "2025-02-21", "end_date": "2025-02-22"},
         # "paths": {"output": "/Users/mikad/MEOMcGill/meo_twitter_scraper/twitter-crawler/output"},
         "limit": {"accounts": 25, "browsers": 6},
-        "seed_query": "Platform:twitter AND Handle:NDPJulia", #"Platform:twitter AND (MainType:news_outlet OR SubType:media)",
+        "seed_query": "Platform:twitter AND Handle:NDPJulia",
+        # "Platform:twitter AND (MainType:news_outlet OR SubType:media)",
         "use_case": 2,
         "scrape_method": "timeline"
     }
 
+    # scrape trends
+    # trends_scrape_dict: dict = collect_trends({"job_id": None, "query": "trending"}) # {"scrape_meta_data": scrape_meta_data, "scraping_results": results}
+    # trends: list = trends_scrape_dict["scraping_results"]
+    # trends = [{'id': 'trend-Gene Hackman', 'rank': 1, 'name': 'Gene Hackman', 'trend_url': {'url': 'twitter://search/?query=%22Gene+Hackman%22&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgMR2VuZSBIYWNrbWFuAAA='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '232K posts', 'url': {'url': 'twitter://search/?query=%22Gene+Hackman%22&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgMR2VuZSBIYWNrbWFuAAA='}]}}}, 'grouped_trends': [{'name': 'Mississippi Burning', 'url': {'url': 'twitter://search/?query=Mississippi+Burning&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgTTWlzc2lzc2lwcGkgQnVybmluZwAA'}]}}}, {'name': 'The French Connection', 'url': {'url': 'twitter://search/?query=The+French+Connection&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgVVGhlIEZyZW5jaCBDb25uZWN0aW9uAAA='}]}}}, {'name': 'The Conversation', 'url': {'url': 'twitter://search/?query=The+Conversation&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgQVGhlIENvbnZlcnNhdGlvbgAA'}]}}}, {'name': 'The Birdcage', 'url': {'url': 'twitter://search/?query=The+Birdcage&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgMVGhlIEJpcmRjYWdlAAA='}]}}}], 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-#Flames1stGoal', 'rank': 2, 'name': '#Flames1stGoal', 'trend_url': {'url': 'twitter://search/?query=%23Flames1stGoal&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgOI0ZsYW1lczFzdEdvYWwAAA=='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'url': {'url': 'twitter://search/?query=%23Flames1stGoal&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgOI0ZsYW1lczFzdEdvYWwAAA=='}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Epstein', 'rank': 3, 'name': 'Epstein', 'trend_url': {'url': 'twitter://search/?query=Epstein&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgHRXBzdGVpbgAA'}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '753K posts', 'url': {'url': 'twitter://search/?query=Epstein&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgHRXBzdGVpbgAA'}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Shrek', 'rank': 4, 'name': 'Shrek', 'trend_url': {'url': 'twitter://search/?query=Shrek&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgFU2hyZWsAAA=='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '109K posts', 'url': {'url': 'twitter://search/?query=Shrek&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgFU2hyZWsAAA=='}]}}}, 'grouped_trends': [{'name': 'Zendaya', 'url': {'url': 'twitter://search/?query=Zendaya&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgHWmVuZGF5YQAA'}]}}}], 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-#PinkShirtDay', 'rank': 5, 'name': '#PinkShirtDay', 'trend_url': {'url': 'twitter://search/?query=%23PinkShirtDay&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgNI1BpbmtTaGlydERheQAA'}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '1,780 posts', 'url': {'url': 'twitter://search/?query=%23PinkShirtDay&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgNI1BpbmtTaGlydERheQAA'}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Tate', 'rank': 6, 'name': 'Tate', 'trend_url': {'url': 'twitter://search/?query=Tate&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgEVGF0ZQAA'}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '147K posts', 'url': {'url': 'twitter://search/?query=Tate&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgEVGF0ZQAA'}]}}}, 'grouped_trends': [{'name': 'Romania', 'url': {'url': 'twitter://search/?query=Romania&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgHUm9tYW5pYQAA'}]}}}, {'name': 'Crimson Tide', 'url': {'url': 'twitter://search/?query=Crimson+Tide&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgMQ3JpbXNvbiBUaWRlAAA='}]}}}], 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-#OntarioVotes2025', 'rank': 7, 'name': '#OntarioVotes2025', 'trend_url': {'url': 'twitter://search/?query=%23OntarioVotes2025&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgRI09udGFyaW9Wb3RlczIwMjUAAA=='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '2,128 posts', 'url': {'url': 'twitter://search/?query=%23OntarioVotes2025&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgRI09udGFyaW9Wb3RlczIwMjUAAA=='}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Chikorita', 'rank': 8, 'name': 'Chikorita', 'trend_url': {'url': 'twitter://search/?query=Chikorita&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgJQ2hpa29yaXRhAAA='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '27.5K posts', 'url': {'url': 'twitter://search/?query=Chikorita&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgJQ2hpa29yaXRhAAA='}]}}}, 'grouped_trends': [{'name': 'Totodile', 'url': {'url': 'twitter://search/?query=Totodile&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgIVG90b2RpbGUAAA=='}]}}}, {'name': '#PokemonDay', 'url': {'url': 'twitter://search/?query=%23PokemonDay&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgLI1Bva2Vtb25EYXkAAA=='}]}}}, {'name': 'Tepig', 'url': {'url': 'twitter://search/?query=Tepig&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgFVGVwaWcAAA=='}]}}}, {'name': 'Scarlet and Violet', 'url': {'url': 'twitter://search/?query=Scarlet+and+Violet&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgSU2NhcmxldCBhbmQgVmlvbGV0AAA='}]}}}], 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-#5YearsofTheManMusicVideo', 'rank': 9, 'name': '#5YearsofTheManMusicVideo', 'trend_url': {'url': 'twitter://search/?query=%235YearsofTheManMusicVideo&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgZIzVZZWFyc29mVGhlTWFuTXVzaWNWaWRlbwAA'}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '3,782 posts', 'url': {'url': 'twitter://search/?query=%235YearsofTheManMusicVideo&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgZIzVZZWFyc29mVGhlTWFuTXVzaWNWaWRlbwAA'}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Carney', 'rank': 10, 'name': 'Carney', 'trend_url': {'url': 'twitter://search/?query=Carney&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgGQ2FybmV5AAA='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '113K posts', 'url': {'url': 'twitter://search/?query=Carney&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgGQ2FybmV5AAA='}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Éric Caire', 'rank': 11, 'name': 'Éric Caire', 'trend_url': {'url': 'twitter://search/?query=%22%C3%89ric+Caire%22&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgLw4lyaWMgQ2FpcmUAAA=='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '2,631 posts', 'url': {'url': 'twitter://search/?query=%22%C3%89ric+Caire%22&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgLw4lyaWMgQ2FpcmUAAA=='}]}}}, 'grouped_trends': [{'name': 'SAAQclic', 'url': {'url': 'twitter://search/?query=SAAQclic&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgIU0FBUWNsaWMAAA=='}]}}}], 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Brookfield', 'rank': 12, 'name': 'Brookfield', 'trend_url': {'url': 'twitter://search/?query=Brookfield&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgKQnJvb2tmaWVsZAAA'}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '24.5K posts', 'url': {'url': 'twitter://search/?query=Brookfield&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgKQnJvb2tmaWVsZAAA'}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-sabrina', 'rank': 13, 'name': 'sabrina', 'trend_url': {'url': 'twitter://search/?query=sabrina&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgHc2FicmluYQAA'}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '57.7K posts', 'url': {'url': 'twitter://search/?query=sabrina&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgHc2FicmluYQAA'}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Megas', 'rank': 14, 'name': 'Megas', 'trend_url': {'url': 'twitter://search/?query=Megas&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgFTWVnYXMAAA=='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '7,299 posts', 'url': {'url': 'twitter://search/?query=Megas&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgFTWVnYXMAAA=='}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Michelle Trachtenberg', 'rank': 15, 'name': 'Michelle Trachtenberg', 'trend_url': {'url': 'twitter://search/?query=%22Michelle+Trachtenberg%22&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgVTWljaGVsbGUgVHJhY2h0ZW5iZXJnAAA='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '497K posts', 'url': {'url': 'twitter://search/?query=%22Michelle+Trachtenberg%22&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgVTWljaGVsbGUgVHJhY2h0ZW5iZXJnAAA='}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Jagmeet', 'rank': 16, 'name': 'Jagmeet', 'trend_url': {'url': 'twitter://search/?query=Jagmeet&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgHSmFnbWVldAAA'}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '23.6K posts', 'url': {'url': 'twitter://search/?query=Jagmeet&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgHSmFnbWVldAAA'}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-#Survivor48', 'rank': 17, 'name': '#Survivor48', 'trend_url': {'url': 'twitter://search/?query=%23Survivor48&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgLI1N1cnZpdm9yNDgAAA=='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '9,087 posts', 'url': {'url': 'twitter://search/?query=%23Survivor48&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgLI1N1cnZpdm9yNDgAAA=='}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Centel', 'rank': 18, 'name': 'Centel', 'trend_url': {'url': 'twitter://search/?query=Centel&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgGQ2VudGVsAAA='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '106K posts', 'url': {'url': 'twitter://search/?query=Centel&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgGQ2VudGVsAAA='}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Savoie', 'rank': 19, 'name': 'Savoie', 'trend_url': {'url': 'twitter://search/?query=Savoie&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgGU2F2b2llAAA='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'url': {'url': 'twitter://search/?query=Savoie&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgGU2F2b2llAAA='}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Johto', 'rank': 20, 'name': 'Johto', 'trend_url': {'url': 'twitter://search/?query=Johto&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgFSm9odG8AAA=='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '8,663 posts', 'url': {'url': 'twitter://search/?query=Johto&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgFSm9odG8AAA=='}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-DAM MV TEASER', 'rank': 21, 'name': 'DAM MV TEASER', 'trend_url': {'url': 'twitter://search/?query=%22DAM+MV+TEASER%22&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgNREFNIE1WIFRFQVNFUgAA'}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '202K posts', 'url': {'url': 'twitter://search/?query=%22DAM+MV+TEASER%22&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgNREFNIE1WIFRFQVNFUgAA'}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Carbon Monoxide', 'rank': 22, 'name': 'Carbon Monoxide', 'trend_url': {'url': 'twitter://search/?query=%22Carbon+Monoxide%22&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgPQ2FyYm9uIE1vbm94aWRlAAA='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '23.4K posts', 'url': {'url': 'twitter://search/?query=%22Carbon+Monoxide%22&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgPQ2FyYm9uIE1vbm94aWRlAAA='}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Onana', 'rank': 23, 'name': 'Onana', 'trend_url': {'url': 'twitter://search/?query=Onana&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgFT25hbmEAAA=='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '75.6K posts', 'url': {'url': 'twitter://search/?query=Onana&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgFT25hbmEAAA=='}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Burna', 'rank': 24, 'name': 'Burna', 'trend_url': {'url': 'twitter://search/?query=Burna&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgFQnVybmEAAA=='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '33.4K posts', 'url': {'url': 'twitter://search/?query=Burna&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgFQnVybmEAAA=='}]}}}, 'grouped_trends': [{'name': 'Lambo', 'url': {'url': 'twitter://search/?query=Lambo&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgFTGFtYm8AAA=='}]}}}], 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Ebola', 'rank': 25, 'name': 'Ebola', 'trend_url': {'url': 'twitter://search/?query=Ebola&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgFRWJvbGEAAA=='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '73.9K posts', 'url': {'url': 'twitter://search/?query=Ebola&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgFRWJvbGEAAA=='}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-New Mexico', 'rank': 26, 'name': 'New Mexico', 'trend_url': {'url': 'twitter://search/?query=%22New+Mexico%22&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgKTmV3IE1leGljbwAA'}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '40.1K posts', 'url': {'url': 'twitter://search/?query=%22New+Mexico%22&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgKTmV3IE1leGljbwAA'}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Gen 2', 'rank': 27, 'name': 'Gen 2', 'trend_url': {'url': 'twitter://search/?query=%22Gen+2%22&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgFR2VuIDIAAA=='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '8,781 posts', 'url': {'url': 'twitter://search/?query=%22Gen+2%22&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgFR2VuIDIAAA=='}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-DeSantis', 'rank': 28, 'name': 'DeSantis', 'trend_url': {'url': 'twitter://search/?query=DeSantis&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgIRGVTYW50aXMAAA=='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '22.1K posts', 'url': {'url': 'twitter://search/?query=DeSantis&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgIRGVTYW50aXMAAA=='}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Gretzky', 'rank': 29, 'name': 'Gretzky', 'trend_url': {'url': 'twitter://search/?query=Gretzky&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgHR3JldHpreQAA'}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '10.9K posts', 'url': {'url': 'twitter://search/?query=Gretzky&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgHR3JldHpreQAA'}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}, {'id': 'trend-Cyndaquil', 'rank': 30, 'name': 'Cyndaquil', 'trend_url': {'url': 'twitter://search/?query=Cyndaquil&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgJQ3luZGFxdWlsAAA='}]}}, 'trend_metadata': {'domain_context': 'Trending in Canada', 'meta_description': '3,869 posts', 'url': {'url': 'twitter://search/?query=Cyndaquil&src=trend_click&pc=true&vertical=trends', 'urlType': 'DeepLink', 'urtEndpointOptions': {'requestParams': [{'key': 'cd', 'value': 'HBgJQ3luZGFxdWlsAAA='}]}}}, 'grouped_trends': None, 'date': '2025-02-27 12:23:20', '_type': 'timelinetrend'}]
+    # trends = [t["name"] for t in trends]
+    # scrape tweets in trend
+    # trends_tweets_scrape: dict = collect_trending_tweets({"job_id": None, "query": "trending", "keywords": trends})
+    res = collect_trends_and_tweets({"job_id": None, "query": "trending"})
+    pass
     """# THE WORKER SCRIPT
     run_scraper(
         {
@@ -511,11 +724,5 @@ if __name__ == "__main__":
             # "job_id": str(uuid.uuid4())
         }
     )"""
-    """run_scraper_daily(
-        {"job_id": str(uuid.uuid4()), "query": "Platform:twitter AND NOT (MainType:news_outlet OR SubType:media)"})"""
-    """accounts = get_accounts(
-        {"job_id": str(uuid.uuid4()),
-         "active": False,
-         "use_case": None}
-    )
-    pass"""
+    """run_scraper_daily({"job_id": str(uuid.uuid4()), "query": "Platform:twitter AND NOT (MainType:news_outlet OR SubType:media)"})
+    """
