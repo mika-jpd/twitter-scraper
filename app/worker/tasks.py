@@ -516,7 +516,7 @@ def run_scraper_daily(scrape_meta_data: dict):
     query: str = scrape_meta_data["query"]  # change what the query is in API
     now: datetime.datetime = datetime.datetime.now()
     start_date = (now - datetime.timedelta(days=4)).strftime("%Y-%m-%d")
-    end_date = (now - datetime.timedelta(days=3)).strftime("%Y-%m-%d")
+    end_date = (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
 
     # setup logging
     setup_logging(job_id=job_id)
@@ -713,7 +713,7 @@ if __name__ == "__main__":
     # trends = [t["name"] for t in trends]
     # scrape tweets in trend
     # trends_tweets_scrape: dict = collect_trending_tweets({"job_id": None, "query": "trending", "keywords": trends})
-    res = collect_trends_and_tweets({"job_id": None, "query": "trending"})
+    #res = collect_trends_and_tweets({"job_id": None, "query": "trending"})
     pass
     """# THE WORKER SCRIPT
     run_scraper(
@@ -724,5 +724,4 @@ if __name__ == "__main__":
             # "job_id": str(uuid.uuid4())
         }
     )"""
-    """run_scraper_daily({"job_id": str(uuid.uuid4()), "query": "Platform:twitter AND NOT (MainType:news_outlet OR SubType:media)"})
-    """
+    run_scraper_daily({"job_id": str(uuid.uuid4()), "query": "Platform:twitter AND NOT (MainType:news_outlet OR SubType:media)"})

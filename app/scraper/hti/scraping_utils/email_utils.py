@@ -13,7 +13,7 @@ from email.message import Message
 from email.header import decode_header
 from dotenv import load_dotenv
 
-# Gmail API logistical_utils
+# Gmail API logistical_scripts
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request

@@ -28,7 +28,7 @@ def get_seeds(username: str = None,
         'only_actives': only_actives
     }
 
-    response: requests.Response = requests.get(f"{base_url}/phh/seedlist/", params=params, headers=headers)
+    response: requests.Response = requests.get(f"{base_url}/phh/seedlist/", params=params, headers=headers, timeout=60)
     response: list[dict[str, str]] = json.loads(response.text)
     return response
 
